@@ -39,12 +39,12 @@
       <th>Tags only here</th>
       <td class="cmp-tag-cell">
         {{if $L.UniqueTags}}
-          {{range $i, $t := $L.UniqueTags}}{{if $i}}, {{end}}<span style="color:{{$t.Color}}" title="{{if $t.Category}}{{$t.Category}}:{{end}}{{$t.Name}}">{{$t.Name}}</span>{{end}}{{if gt $L.UniqueTagsTotal (len $L.UniqueTags)}}, <span class="field-hint">+{{sub $L.UniqueTagsTotal (len $L.UniqueTags)}} more</span>{{end}}
+          {{range $i, $t := $L.UniqueTags}}{{if $i}}, {{end}}<span style="color:{{catColor $t.Color}}" title="{{if $t.Category}}{{$t.Category}}:{{end}}{{$t.Name}}">{{$t.Name}}</span>{{end}}{{if gt $L.UniqueTagsTotal (len $L.UniqueTags)}}, <span class="field-hint">+{{sub $L.UniqueTagsTotal (len $L.UniqueTags)}} more</span>{{end}}
         {{else}}(none){{end}}
       </td>
       <td class="cmp-tag-cell">
         {{if $R.UniqueTags}}
-          {{range $i, $t := $R.UniqueTags}}{{if $i}}, {{end}}<span style="color:{{$t.Color}}" title="{{if $t.Category}}{{$t.Category}}:{{end}}{{$t.Name}}">{{$t.Name}}</span>{{end}}{{if gt $R.UniqueTagsTotal (len $R.UniqueTags)}}, <span class="field-hint">+{{sub $R.UniqueTagsTotal (len $R.UniqueTags)}} more</span>{{end}}
+          {{range $i, $t := $R.UniqueTags}}{{if $i}}, {{end}}<span style="color:{{catColor $t.Color}}" title="{{if $t.Category}}{{$t.Category}}:{{end}}{{$t.Name}}">{{$t.Name}}</span>{{end}}{{if gt $R.UniqueTagsTotal (len $R.UniqueTags)}}, <span class="field-hint">+{{sub $R.UniqueTagsTotal (len $R.UniqueTags)}} more</span>{{end}}
         {{else}}(none){{end}}
       </td>
     </tr>
@@ -53,7 +53,7 @@
     <tr class="cmp-shared-row">
       <th>Shared tags</th>
       <td colspan="2" class="cmp-tag-cell">
-        {{range .SharedTags}}<span class="cmp-shared-tag" style="color:{{.Color}}" title="{{if .Category}}{{.Category}}:{{end}}{{.Name}}">{{.Name}} <span class="cmp-shared-weight">{{printf "%.1f" .Weight}}</span></span>{{end}}
+        {{range .SharedTags}}<span class="cmp-shared-tag" style="color:{{catColor .Color}}" title="{{if .Category}}{{.Category}}:{{end}}{{.Name}}">{{.Name}} <span class="cmp-shared-weight">{{printf "%.1f" .Weight}}</span></span>{{end}}
         {{if gt .SharedTagsTotal (len .SharedTags)}}<span class="field-hint">+{{sub .SharedTagsTotal (len .SharedTags)}} more</span>{{end}}
       </td>
     </tr>

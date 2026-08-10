@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/monbooru/monbooru/internal/db"
@@ -120,6 +121,49 @@ func createdAfterCutoff(raw string) string {
 	return raw
 }
 
+// tagsSidebarCounts are the sidebar's badge counts and label sets. Every
+// one of them aggregates over the whole catalog regardless of which page
+// the listing is showing, so together they set the floor for a /tags
+// render.
+type tagsSidebarCounts struct {
+	Conflicts  int
+	Stale      int
+	FullyStale int
+	Folded     int
+	Origins    []tags.OriginCount
+	UsedBy     []string
+	Err        error
+}
+
+// tagsSidebarLoad runs the badge queries side by side, the way the
+// gallery sidebar loads its own aggregates: run in sequence their scans
+// add up to more than the listing they decorate.
+func (s *Server) tagsSidebarLoad() tagsSidebarCounts {
+	var c tagsSidebarCounts
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	svc := s.tagSvc()
+	run := func(fn func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := fn(); err != nil {
+				mu.Lock()
+				c.Err = cmp.Or(c.Err, err)
+				mu.Unlock()
+			}
+		}()
+	}
+	run(func() (err error) { c.Conflicts, err = svc.ConflictsCount(); return })
+	run(func() (err error) { c.Stale, err = svc.StaleUsageCount(); return })
+	run(func() (err error) { c.FullyStale, err = svc.FullyStaleCount(); return })
+	run(func() (err error) { c.Folded, err = svc.FoldedDuplicatesCount(); return })
+	run(func() (err error) { c.Origins, err = svc.OriginCounts(); return })
+	run(func() (err error) { c.UsedBy, err = svc.UsedByLabels(); return })
+	wg.Wait()
+	return c
+}
+
 func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
 	// The tags page reflects rapidly-changing state (category re-assignment,
 	// merges). Opt out of browser caching so a reload after a mutation never
@@ -183,53 +227,28 @@ func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conflictsTotal, err := s.tagSvc().ConflictsCount()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	staleTotal, err := s.tagSvc().StaleUsageCount()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	fullyStaleTotal, err := s.tagSvc().FullyStaleCount()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	foldedTotal, err := s.tagSvc().FoldedDuplicatesCount()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	originCounts, err := s.tagSvc().OriginCounts()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	usedByLabels, err := s.tagSvc().UsedByLabels()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	counts := s.tagsSidebarLoad()
+	if counts.Err != nil {
+		http.Error(w, counts.Err.Error(), http.StatusInternalServerError)
 		return
 	}
 	rowIDs := make([]int64, 0, len(tagList))
 	for _, t := range tagList {
 		rowIDs = append(rowIDs, t.ID)
 	}
-	usedBySources, err := s.tagSvc().UsedByForTags(rowIDs, usedByLabels)
+	usedBySources, err := s.tagSvc().UsedByForTags(rowIDs, counts.UsedBy)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	pageLabels := make([]string, 0, len(tagList)+len(originCounts)+len(usedByLabels))
+	pageLabels := make([]string, 0, len(tagList)+len(counts.Origins)+len(counts.UsedBy))
 	for _, t := range tagList {
 		pageLabels = append(pageLabels, t.Origin)
 	}
-	for _, oc := range originCounts {
+	for _, oc := range counts.Origins {
 		pageLabels = append(pageLabels, oc.Label)
 	}
-	pageLabels = append(pageLabels, usedByLabels...)
+	pageLabels = append(pageLabels, counts.UsedBy...)
 
 	data := tagsPageData{
 		baseData:        s.base(r, "tags", "Tags - "+s.booruName()),
@@ -247,15 +266,15 @@ func (s *Server) tagsHandler(w http.ResponseWriter, r *http.Request) {
 		Type:            p.Type,
 		CreatedAfter:    p.CreatedAfter,
 		Conflicts:       p.Conflicts,
-		ConflictsTotal:  conflictsTotal,
+		ConflictsTotal:  counts.Conflicts,
 		Stale:           p.Stale,
-		StaleTotal:      staleTotal,
-		FullyStaleTotal: fullyStaleTotal,
+		StaleTotal:      counts.Stale,
+		FullyStaleTotal: counts.FullyStale,
 		Folded:          p.Folded,
-		FoldedTotal:     foldedTotal,
-		OriginCounts:    originCounts,
+		FoldedTotal:     counts.Folded,
+		OriginCounts:    counts.Origins,
 		UsedBy:          p.UsedBy,
-		UsedByLabels:    usedByLabels,
+		UsedByLabels:    counts.UsedBy,
 		UsedBySources:   usedBySources,
 		OriginKinds:     s.originKinds(pageLabels),
 		ShowZero:        p.ShowZero,

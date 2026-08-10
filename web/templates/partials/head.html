@@ -6,5 +6,6 @@
   <link rel="icon" type="image/png" href="{{.BooruFavicon}}">
   <link rel="manifest" href="/manifest.json">
   <link rel="stylesheet" href="/static/main.css">
+  {{if .Theme}}<link rel="stylesheet" href="/theme.css">{{end}}
   {{if .CustomCSS}}<link rel="stylesheet" href="/custom.css">{{end}}
 {{end}}

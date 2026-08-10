@@ -10,8 +10,9 @@
 {{- else if eq .FileType "cbz" -}}
 <img src="/thumbnails/{{.ActiveGallery}}/{{.ID}}.jpg" alt="image {{.ID}}" class="session-cell-img">
 {{- /* Static image: the 360px thumbnail looks soft at this size, so serve
-       the real bytes and let the browser scale them. */ -}}
+       the real bytes and let the browser scale them - through /view, which
+       hands back a bounded rendition for the sizes no browser will decode. */ -}}
 {{- else -}}
-<img src="/images/{{.ID}}/file" alt="image {{.ID}}" class="session-cell-img" loading="lazy">
+<img src="/images/{{.ID}}/view" alt="image {{.ID}}" class="session-cell-img" loading="lazy">
 {{- end -}}
 {{end}}

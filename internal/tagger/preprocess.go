@@ -18,19 +18,21 @@ import (
 // the tensor.
 var inputTensorPools sync.Map
 
+// The pool holds *[]float32, not []float32: pooling the slice itself boxes
+// its header into the interface on every Put, which allocates.
 func acquireTensor(size int) []float32 {
 	if p, ok := inputTensorPools.Load(size); ok {
-		return p.(*sync.Pool).Get().([]float32)
+		return *p.(*sync.Pool).Get().(*[]float32)
 	}
 	n := size
-	fresh := &sync.Pool{New: func() any { return make([]float32, 3*n*n) }}
+	fresh := &sync.Pool{New: func() any { buf := make([]float32, 3*n*n); return &buf }}
 	actual, _ := inputTensorPools.LoadOrStore(size, fresh)
-	return actual.(*sync.Pool).Get().([]float32)
+	return *actual.(*sync.Pool).Get().(*[]float32)
 }
 
 func releaseTensor(size int, buf []float32) {
 	if p, ok := inputTensorPools.Load(size); ok {
-		p.(*sync.Pool).Put(buf)
+		p.(*sync.Pool).Put(&buf)
 	}
 }
 

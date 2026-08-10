@@ -9,42 +9,18 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/monbooru/monbooru/internal/lookup"
 )
 
-// monloaderClient is the only outbound HTTP client monbooru uses, and it is
-// only ever pointed at the configured monloader (SPECIFICATIONS.md 14.5).
-// Per-call deadlines belong to the request contexts (probes 4-5 s,
+// monloaderClient is the outbound HTTP client for the companion monloader,
+// and it is only ever pointed at the configured instance (SPECIFICATIONS.md
+// 14.5). Per-call deadlines belong to the request contexts (probes 4-5 s,
 // contribution previews 8 s, sends 10 s); the client timeout is only a
 // backstop for the callers that pass an unbounded context, and must stay
 // above the largest per-call deadline or it aborts a send monloader may
 // still commit.
 var monloaderClient = &http.Client{Timeout: 15 * time.Second}
-
-// notifyMonloaderTeardown asks monloader to drop its side of the pairing and
-// returns an error when it could not be reached, so the caller can tell the
-// operator to remove the far end by hand.
-func (s *Server) notifyMonloaderTeardown(baseURL, token string) error {
-	base := strings.TrimRight(baseURL, "/")
-	if base == "" || token == "" {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/pair/remove", nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := monloaderClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return monloaderStatusError{resp.Status}
-	}
-	return nil
-}
 
 // monloaderPost sends one JSON body to a monloader API path and returns
 // the live response for the caller to map. The token read happens under
@@ -70,20 +46,29 @@ func (s *Server) monloaderPost(ctx context.Context, path string, payload map[str
 
 // enqueueMonloader posts one enqueue payload and maps the reply: any
 // non-2xx is a per-request refusal the caller can skip a row over.
-// onConflict, when set, names what a 409 means for that endpoint.
-func (s *Server) enqueueMonloader(ctx context.Context, path string, payload map[string]any, onConflict error) error {
+// onConflict, when set, names what a 409 means for that endpoint. The
+// returned job id is what lets a caller resolve an attempt whose callback
+// never arrives; it is zero against a monloader that reports none.
+func (s *Server) enqueueMonloader(ctx context.Context, path string, payload map[string]any, onConflict error) (int64, error) {
 	resp, err := s.monloaderPost(ctx, path, payload)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if onConflict != nil && resp.StatusCode == http.StatusConflict {
-		return onConflict
+		return 0, onConflict
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return 0, errLookupBudgetSpent
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return monloaderStatusError{resp.Status}
+		return 0, peerStatusError{monloaderApp, resp.Status}
 	}
-	return nil
+	var out struct {
+		JobID int64 `json:"job_id"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return out.JobID, nil
 }
 
 // EnqueueMetadataFetch asks monloader to re-read the post at url (metadata
@@ -91,8 +76,9 @@ func (s *Server) enqueueMonloader(ctx context.Context, path string, payload map[
 // work - gallery-dl, mapping, the enrich call back into monbooru - runs on
 // monloader; monbooru only enqueues, keeping its single-egress model intact.
 func (s *Server) EnqueueMetadataFetch(ctx context.Context, imageID int64, gallery, url string) error {
-	return s.enqueueMonloader(ctx, "/api/v1/metadata",
+	_, err := s.enqueueMonloader(ctx, "/api/v1/metadata",
 		map[string]any{"image_id": imageID, "gallery": gallery, "url": url}, nil)
+	return err
 }
 
 // EnqueueReplace asks monloader to download the file the post at url serves
@@ -100,35 +86,94 @@ func (s *Server) EnqueueMetadataFetch(ctx context.Context, imageID int64, galler
 // fetch, only the enqueue happens here; the download, the hash verify, and
 // the push back into the replace endpoint all run on monloader.
 func (s *Server) EnqueueReplace(ctx context.Context, imageID int64, gallery, url string) error {
-	return s.enqueueMonloader(ctx, "/api/v1/replace",
+	_, err := s.enqueueMonloader(ctx, "/api/v1/replace",
 		map[string]any{"image_id": imageID, "gallery": gallery, "url": url}, nil)
+	return err
 }
 
 // errPTRUnavailable marks a lookup monloader refused because its PTR backend
 // is off - a stale capability read, not a connectivity failure.
 var errPTRUnavailable = errors.New("the PTR lookup is unavailable on monloader")
 
-// monloaderStatusError is a non-2xx reply to one request (a bad url, a
-// malformed hash) - the request was refused, not a sign monloader is down, so
-// a batch can skip the row instead of aborting.
-type monloaderStatusError struct{ status string }
+// errLookupBudgetSpent marks a budgeted lookup monloader refused for the day.
+// Only the scheduled phase sends one, and it stops the phase rather than
+// walking the rest of the gallery into the same answer.
+var errLookupBudgetSpent = errors.New("monloader's daily lookup budget is spent")
 
-func (e monloaderStatusError) Error() string { return "monloader returned " + e.status }
+// errPTRBatchUnsupported marks a monloader too old for the batch PTR
+// endpoint. The phase reports it once and does nothing else: falling back to
+// one queued job per image is the exact thing the batch endpoint exists to
+// stop.
+var errPTRBatchUnsupported = errors.New("monloader is too old for batch PTR lookup")
 
-// isMonloaderStatusErr reports whether err is a per-request status refusal.
-func isMonloaderStatusErr(err error) bool {
-	var se monloaderStatusError
+// peerStatusError is a non-2xx reply to one request (a bad url, a malformed
+// hash, an endpoint the peer does not implement) - the request was refused,
+// not a sign the peer is down, so a batch can skip the row instead of
+// aborting. It names the peer: the same client calls monloader and every
+// third-party plugin, and a message about a plugin that says "monloader"
+// sends the operator looking in the wrong place.
+type peerStatusError struct{ peer, status string }
+
+func (e peerStatusError) Error() string { return e.peer + " returned " + e.status }
+
+// isPeerStatusErr reports whether err is a per-request status refusal.
+func isPeerStatusErr(err error) bool {
+	var se peerStatusError
 	return errors.As(err, &se)
 }
 
 // EnqueueHashLookup asks monloader to find tags for image imageID by file
 // hash - backend "booru" walks the opted-in sites' md5 search, backend "ptr"
 // queries monloader's local PTR index by sha256 - and enrich the image back
-// through the same callbacks a source refetch uses.
-func (s *Server) EnqueueHashLookup(ctx context.Context, imageID int64, gallery, backend, md5, sha256 string) error {
+// through the same callbacks a source refetch uses. background puts the job
+// behind anything a person is watching; budgeted also spends a slot of
+// monloader's daily allowance and can be refused. Returns monloader's job id
+// so the attempt can be reconciled if its callback goes missing.
+func (s *Server) EnqueueHashLookup(ctx context.Context, imageID int64, gallery, backend, md5, sha256 string, background, budgeted bool) (int64, error) {
 	return s.enqueueMonloader(ctx, "/api/v1/lookup", map[string]any{
 		"image_id": imageID, "gallery": gallery, "backend": backend, "md5": md5, "sha256": sha256,
+		"background": background, "budgeted": budgeted,
 	}, errPTRUnavailable)
+}
+
+// ptrLookupImage is one image in a batch PTR lookup: the hash to look up and
+// the id monloader names it by on the history row it files.
+type ptrLookupImage struct {
+	ImageID int64  `json:"image_id"`
+	SHA256  string `json:"sha256"`
+}
+
+// ptrBatchLookup asks monloader for the PTR tags of a batch of images. The
+// answer is the outcome - no enqueue, no callback to lose - which is why a
+// whole-library pass goes through here rather than one queued job per image;
+// monloader files the batch as one history row, in the same scheduled / bulk
+// lane a queued lookup would take. Returns the tags per matched hash (misses
+// are absent) and its index cursor at answer time.
+func (s *Server) ptrBatchLookup(ctx context.Context, gallery string, scheduled bool, images []ptrLookupImage) (map[string][]string, uint64, error) {
+	resp, err := s.monloaderPost(ctx, "/api/v1/ptr/lookup", map[string]any{
+		"images": images, "gallery": gallery, "scheduled": scheduled,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusConflict {
+		return nil, 0, errPTRUnavailable
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, 0, errPTRBatchUnsupported
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, 0, peerStatusError{monloaderApp, resp.Status}
+	}
+	var out struct {
+		Index   uint64              `json:"index"`
+		Results map[string][]string `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, 0, err
+	}
+	return out.Results, out.Index, nil
 }
 
 // ptrTagInfo is one tag's answer from monloader's PTR graph query, in
@@ -189,6 +234,18 @@ func (s *Server) monloaderAPIBase() string {
 	return ""
 }
 
+// monloaderUsable reports whether the link is actually up, so the
+// monloader-backed surfaces and the scheduled phases can skip when it is
+// paused, unreachable, or rejecting. A cold cache ("") stays optimistic so a
+// fresh boot does not blank the buttons before the first probe lands.
+func (s *Server) monloaderUsable() bool {
+	conn, _, _, _, _ := s.monloaderStatusSeed()
+	if s.monloaderPaused() {
+		return false
+	}
+	return s.pairedWith("monloader") && conn != "down" && conn != "rejected"
+}
+
 // monloaderPaused reports whether the operator has suspended the monloader
 // link from the footer light. Read directly from config so the light can tell
 // a paused pairing apart from an unconfigured or unreachable one.
@@ -239,7 +296,10 @@ func (s *Server) checkMonloader(ctx context.Context) (status, version string, pt
 		preq.Header.Set("Authorization", "Bearer "+tok)
 		if presp, perr := monloaderClient.Do(preq); perr == nil {
 			var p struct {
-				Enabled bool   `json:"enabled"`
+				Enabled  bool `json:"enabled"`
+				Progress struct {
+					UpdateIndex uint64 `json:"update_index"`
+				} `json:"progress"`
 				State   string `json:"state"`
 				Contrib *struct {
 					Account bool `json:"account"`
@@ -250,6 +310,12 @@ func (s *Server) checkMonloader(ctx context.Context) (status, version string, pt
 			_ = json.NewDecoder(presp.Body).Decode(&p)
 			_ = presp.Body.Close()
 			on := presp.StatusCode == http.StatusOK && p.Enabled
+			// The `lookup:due` filter reads the cursor to skip images whose
+			// PTR miss predates no index movement, and this probe is the one
+			// thing that runs on a box nobody has a page open on.
+			if p.Progress.UpdateIndex > 0 {
+				lookup.PTRCursor.Store(p.Progress.UpdateIndex)
+			}
 			// monloader refuses every PTR read until its index is caught
 			// up, so an index that is merely enabled is not usable yet.
 			ptrReady = on && p.State == "ready"

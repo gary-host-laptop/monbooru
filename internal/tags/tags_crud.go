@@ -220,9 +220,10 @@ func tagFilterWhere(filter TagFilter) (string, []any) {
 		args = append(args, filter.CreatedAfter)
 	}
 	if filter.ConflictsOnly {
+		// Same row-counting shape as ConflictsCount so badge and listing agree.
 		where += ` AND t.is_alias = 0 AND t.name IN (
 			SELECT name FROM tags WHERE is_alias = 0
-			GROUP BY name HAVING COUNT(DISTINCT category_id) >= 2)`
+			GROUP BY name HAVING COUNT(*) >= 2)`
 	}
 	// The IN over the small stale slice bounds the scan to tags that have any
 	// stale row; the "full" count subquery then runs only for those. Implied
@@ -314,6 +315,10 @@ func (s *Service) ListTags(filter TagFilter) ([]models.Tag, int, error) {
 		foldedCol = `(SELECT t2.name FROM folded_tag_pairs fp JOIN tags t2 ON t2.id = fp.new_id WHERE fp.old_id = t.id AND fp.ambiguous = 0 LIMIT 1)`
 	}
 
+	// The page is picked from tags alone so the sort index can serve it
+	// and stop at the limit; with the joins in the same SELECT the
+	// planner drives from tag_categories, reads every tag row through
+	// idx_tags_category and temp-sorts the catalog to return a hundred.
 	// LEFT JOIN pulls the canonical name/category when t.is_alias = 1
 	// so the caller can render "alias -> canonical" without a second
 	// round trip.
@@ -324,12 +329,12 @@ func (s *Service) ListTags(filter TagFilter) ([]models.Tag, int, error) {
 		        (SELECT COUNT(*) FROM image_tags it WHERE it.tag_id = t.id AND it.stale = 1),
 		        %s,
 		        c.name, cc.name, cc.color
-		 FROM tags t
+		 FROM (SELECT t.* FROM tags t WHERE %s ORDER BY %s LIMIT ? OFFSET ?) t
 		 JOIN tag_categories tc ON tc.id = t.category_id
 		 LEFT JOIN tags c ON c.id = t.canonical_tag_id
 		 LEFT JOIN tag_categories cc ON cc.id = c.category_id
-		 WHERE %s ORDER BY %s LIMIT ? OFFSET ?`,
-		foldedCol, where, orderBy,
+		 ORDER BY %s`,
+		foldedCol, where, orderBy, orderBy,
 	)
 	args = append(args, limit, offset)
 
@@ -388,11 +393,16 @@ func (s *Service) ListTags(filter TagFilter) ([]models.Tag, int, error) {
 // ConflictsCount reports how many tag names occupy more than one
 // category, for the /tags Conflicts filter badge and the Maintenance
 // diagnostic.
+//
+// UNIQUE(name, category_id) makes COUNT(*) per name equal to the count
+// of distinct categories, and the row form is what keeps the scan inside
+// idx_tags_active_name: reading category_id would send every row back to
+// the table, which is an order of magnitude slower on a large catalog.
 func (s *Service) ConflictsCount() (int, error) {
 	var n int
 	err := s.db.Read.QueryRow(`SELECT COUNT(*) FROM (
 		SELECT name FROM tags WHERE is_alias = 0
-		GROUP BY name HAVING COUNT(DISTINCT category_id) >= 2)`).Scan(&n)
+		GROUP BY name HAVING COUNT(*) >= 2)`).Scan(&n)
 	return n, err
 }
 

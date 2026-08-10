@@ -1,87 +1,11 @@
 {{define "partials/tag_list.html"}}
+{{/* The image's tags are listed in the sidebar; what stays under the image is
+     the editor's own feedback: the add/remove flashes and the session's own
+     adds, mirrored from the sidebar by separateNewTags. */}}
 <div id="image-tags" data-image-id="{{.ImageID}}">
   {{if .ErrMsg}}<div class="flash flash-err" style="margin-bottom:4px">{{.ErrMsg}}</div>{{end}}
   {{if .WarnMsg}}<div class="flash flash-warn" style="margin-bottom:4px">{{.WarnMsg}}</div>{{end}}
   {{if .OkMsg}}<div class="flash flash-ok" style="margin-bottom:4px">{{.OkMsg}}</div>{{end}}
-  {{$groups := groupByImageSource .ImageTags}}
-  {{$implied := impliedFromImageTags .ImageTags}}
-  {{if $groups}}
-    {{range $groups}}
-    {{$extra := sourceExtraTags . $.ImageTags $.TagSources}}
-    {{/* The bulk-remove route each group maps to; empty when the group is a
-         single row (its own x covers it) or carries no targetable label. */}}
-    {{$stale := "0"}}{{if .Stale}}{{$stale = "1"}}{{end}}
-    {{$groupDelete := ""}}
-    {{if gt (len .Tags) 1}}
-      {{if eq .Kind "user"}}{{$groupDelete = printf "/images/%d/user-tags" $.ImageID}}
-      {{else if eq .Kind "source"}}{{$groupDelete = printf "/images/%d/source-tags?sources=%s&stale=%s" $.ImageID (urlQ .Source) $stale}}
-      {{else if eq .Kind "auto"}}{{$groupDelete = printf "/images/%d/auto-tags?taggers=%s" $.ImageID (urlQ .Source)}}{{end}}
-    {{end}}
-    <div class="tag-source-group{{if .Stale}} tag-source-stale{{end}}" data-source="{{.Source}}">
-      <h4 class="tag-source-title{{if $extra}} tag-source-toggle{{end}}"
-          {{if $extra}}onclick="toggleSourceExtra(this)"
-          title="Show every tag {{.Title}} covers, including ones listed under another source"{{end}}>{{.Title}}{{if $extra}} <span class="tag-source-extra-count">+{{len $extra}}</span>{{end}}{{if $groupDelete}}
-        <button type="button" class="btn-link-accent tag-group-delete"
-                onclick="event.stopPropagation()"
-                hx-delete="{{$groupDelete}}"
-                hx-target="#image-tags"
-                hx-swap="outerHTML"
-                hx-headers='{"X-CSRF-Token":"{{$.CSRFToken}}"}'
-                hx-confirm="Remove the {{len .Tags}} tags under {{.Title}}?"
-                data-confirm-ok="Remove"
-                title="Remove the tags listed here">[×]</button>{{end}}</h4>
-      <ul class="tag-list" data-source="{{.Source}}">
-        {{range .Tags}}
-        <li class="tag-item" data-tag-id="{{.TagID}}" data-source="{{if .IsAuto}}auto{{else}}user{{end}}" style="color:{{.Color}}">
-          <a href="/?q={{.Category}}:{{.TagName}}" class="tag-chip-name">{{.TagName}}</a>
-          {{if .IsAuto}}{{with autoConfPct .Confidence}}<span class="auto-conf">{{.}}%</span>{{end}}{{end}}
-          <button class="tag-remove-btn"
-                  hx-delete="/images/{{$.ImageID}}/tags/{{.TagID}}"
-                  hx-target="#image-tags"
-                  hx-swap="outerHTML"
-                  hx-headers='{"X-CSRF-Token":"{{$.CSRFToken}}"}'
-                  title="Remove tag">×</button>
-        </li>
-        {{end}}
-      </ul>
-      {{if $extra}}
-      <ul class="tag-list tag-source-extra" data-source="{{.Source}}" hidden>
-        {{range $extra}}
-        <li class="tag-item tag-source-extra-entry" data-tag-id="{{.TagID}}" style="color:{{.Color}}">
-          <a href="/?q={{.Category}}:{{.TagName}}" class="tag-chip-name">{{.TagName}}</a>
-        </li>
-        {{end}}
-      </ul>
-      {{end}}
-    </div>
-    {{end}}
-  {{else}}
-  <ul class="tag-list"><li class="no-tags">No tags yet.</li></ul>
-  {{end}}
-  {{if or $implied .Aliases}}
-  <details class="tag-source-group" data-source="implied">
-    <summary class="tag-source-title">{{if and $implied .Aliases}}Implied tags and aliases{{else if $implied}}Implied tags{{else}}Aliases{{end}}</summary>
-    {{if $implied}}
-    <ul class="tag-list" data-source="implied">
-      {{range $implied}}
-      <li class="tag-item tag-implied-entry" data-tag-id="{{.TagID}}" data-source="implied" style="color:{{.Color}}">
-        <a href="/?q={{.Category}}:{{.TagName}}" class="tag-chip-name">{{.TagName}}</a>
-      </li>
-      {{end}}
-    </ul>
-    {{end}}
-    {{if .Aliases}}
-    <ul class="tag-list" data-source="alias">
-      {{range .Aliases}}
-      <li class="tag-item tag-alias-entry" data-tag-id="{{.ID}}" data-source="alias" style="color:{{.CategoryColor}}">
-        <a href="/?q={{.CanonicalCategoryName}}:{{.CanonicalName}}" class="tag-chip-name">{{.Name}}</a>
-      </li>
-      {{end}}
-    </ul>
-    {{end}}
-  </details>
-  {{end}}
-  <hr class="tag-list-divider" hidden>
   <h4 class="tag-list-added-title" hidden>Just added</h4>
   <ul class="tag-list tag-list-added"></ul>
 </div>

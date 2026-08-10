@@ -17,12 +17,13 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/models"
 )
 
 // Config holds all application configuration.
 type Config struct {
 	DefaultGallery string          `toml:"default_gallery"`
-	Galleries      []Gallery       `toml:"galleries"`
+	Galleries      []Gallery       `toml:"galleries,omitempty"`
 	Server         ServerConfig    `toml:"server"`
 	Monloader      MonloaderConfig `toml:"monloader"`
 	Paths          PathsConfig     `toml:"paths"`
@@ -33,6 +34,11 @@ type Config struct {
 	Log            LogConfig       `toml:"log"`
 	Schedule       ScheduleConfig  `toml:"schedule"`
 	Relations      RelationsConfig `toml:"relations"`
+	// Emptied arrays of tables are omitted rather than written as
+	// `key = []`: TOML refuses a later `[[key]]` block under a key already
+	// bound to an inline array, so a file monbooru wrote would stop loading
+	// the moment a block was put back by hand.
+	Plugins []PluginConfig `toml:"plugin,omitempty"`
 }
 
 // RelationsConfig drives the relations feature's runtime knobs.
@@ -89,6 +95,16 @@ type ServerConfig struct {
 	// and the topbar logo on every page. Path scope is gated at config
 	// load against the same trusted-roots check as CustomCSS.
 	BooruLogo string `toml:"logo"`
+	// Theme names an operator-installed theme under <configdir>/themes/ - a
+	// folder holding theme.css (and optionally logo.png) or a bare
+	// <name>.css. Always a basename, validated against the folder listing
+	// before it reaches ServeFile; empty is the shipped look.
+	Theme string `toml:"theme,omitempty"`
+	// ThemeColor is the #rgb / #rrggbb the web manifest reports as the
+	// splash and address-bar colour. The server can't read a custom
+	// stylesheet's palette, so a retheme sets this to its own background.
+	// Empty resolves to the bundled palette at render time.
+	ThemeColor string `toml:"theme_color"`
 	// MonloaderURL is the browser-facing base of the companion monloader
 	// instance; the footer "connected to monloader" link points at its queue.
 	// Blank falls back to the api url.
@@ -108,6 +124,156 @@ type MonloaderConfig struct {
 	// so the footer light's kill switch is reversible: the credentials
 	// survive and re-enabling resumes connectivity with no re-pair.
 	Paused bool `toml:"paused,omitempty"`
+}
+
+// PluginConfig is one third-party peer, written by the pairing claim and by
+// the enable switch on a dropped folder's row - never by hand. APIURL
+// overrides the address learned at pairing, mirroring [monloader].api_url.
+// No launch line lives here: a plugin monbooru runs is a folder under
+// <configdir>/plugins/ carrying its own manifest, so a block never names a
+// program.
+type PluginConfig struct {
+	Name      string `toml:"name"`
+	Version   string `toml:"version,omitempty"`
+	APIURL    string `toml:"api_url,omitempty"`
+	PeerToken string `toml:"peer_token,omitempty"`
+	Paused    bool   `toml:"paused,omitempty"`
+	// Enabled is the boot-start switch for a plugin discovered under the
+	// plugins folder; its launch line lives in the folder's manifest, so the
+	// block only records the operator's start/stop choice.
+	Enabled bool           `toml:"enabled,omitempty"`
+	Buttons []PluginButton `toml:"button,omitempty"`
+}
+
+// PluginButton is one entry a peer renders in a mount point. Path joins the
+// peer's base address. Media is a comma-joined list of models.MediaKinds
+// limiting the button to what the peer can actually work on.
+type PluginButton struct {
+	Slot  string `toml:"slot" json:"slot"`
+	Label string `toml:"label" json:"label"`
+	Mode  string `toml:"mode" json:"mode"`
+	Path  string `toml:"path,omitempty" json:"path,omitempty"`
+	Media string `toml:"media,omitempty" json:"media,omitempty"`
+}
+
+// AppliesTo reports whether the button covers a file type. A button naming
+// no media takes everything.
+func (b PluginButton) AppliesTo(fileType string) bool {
+	if b.Media == "" {
+		return true
+	}
+	kind := models.MediaKind(fileType)
+	for _, v := range strings.Split(b.Media, ",") {
+		if strings.TrimSpace(v) == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// The mount points and button modes plugins may declare.
+const (
+	SlotDetailActions = "detail-actions"
+	SlotBatchBar      = "batch-bar"
+	ModeOpen          = "open"
+	ModeRelay         = "relay"
+)
+
+// MaxPluginLabel caps a button label, and MaxPluginVersion the peer's
+// self-reported version; both are rendered as text on operator surfaces.
+const (
+	MaxPluginLabel      = 24
+	MaxPluginVersion    = 32
+	maxPluginSlotButton = 4
+)
+
+// PluginVars are the substitution variables an open-mode target may carry.
+var PluginVars = []string{"{image_id}", "{gallery}", "{back_url}"}
+
+var (
+	pluginNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
+	pluginVarRe  = regexp.MustCompile(`\{[^}]*\}`)
+)
+
+// reservedPluginNames name monbooru itself; a peer taking one would make
+// every log line and settings row ambiguous.
+var reservedPluginNames = []string{"monbooru", "api", "default"}
+
+// ValidatePluginName gates the string that becomes a TOML block key, a
+// config-map key, a log prefix and settings-row text.
+func ValidatePluginName(name string) error {
+	if !pluginNameRe.MatchString(name) {
+		return fmt.Errorf("plugin name %q must match [A-Za-z0-9_-]{1,32}", name)
+	}
+	if slices.Contains(reservedPluginNames, strings.ToLower(name)) {
+		return fmt.Errorf("plugin name %q is reserved", name)
+	}
+	return nil
+}
+
+// ValidatePluginButton rejects anything monbooru could not render or route.
+func ValidatePluginButton(b PluginButton) error {
+	if b.Slot != SlotDetailActions && b.Slot != SlotBatchBar {
+		return fmt.Errorf("unknown slot %q", b.Slot)
+	}
+	if b.Mode != ModeOpen && b.Mode != ModeRelay {
+		return fmt.Errorf("unknown mode %q", b.Mode)
+	}
+	// A batch-bar click carries a scope, which a page cannot receive.
+	if b.Mode == ModeOpen && b.Slot != SlotDetailActions {
+		return fmt.Errorf("open mode is only valid on %s", SlotDetailActions)
+	}
+	label := strings.TrimSpace(b.Label)
+	if label == "" || len(label) > MaxPluginLabel {
+		return fmt.Errorf("label must be 1-%d characters", MaxPluginLabel)
+	}
+	if b.Media != "" {
+		for _, v := range strings.Split(b.Media, ",") {
+			if kind := strings.TrimSpace(v); !slices.Contains(models.MediaKinds, kind) {
+				return fmt.Errorf("unknown media %q", kind)
+			}
+		}
+	}
+	// Relay posts to the peer base when no path is declared; an open link
+	// has nowhere to go without one.
+	if b.Path == "" && b.Mode == ModeOpen {
+		return fmt.Errorf("open mode needs a path")
+	}
+	if b.Path != "" && !strings.HasPrefix(b.Path, "/") {
+		return fmt.Errorf("path %q must start with /", b.Path)
+	}
+	for _, v := range pluginVarRe.FindAllString(b.Path, -1) {
+		if !slices.Contains(PluginVars, v) {
+			return fmt.Errorf("unknown substitution variable %s", v)
+		}
+	}
+	return nil
+}
+
+// ValidatePluginButtons validates each button and caps how many one peer
+// may put in a single slot.
+func ValidatePluginButtons(buttons []PluginButton) error {
+	perSlot := map[string]int{}
+	for _, b := range buttons {
+		if err := ValidatePluginButton(b); err != nil {
+			return err
+		}
+		perSlot[b.Slot]++
+		if perSlot[b.Slot] > maxPluginSlotButton {
+			return fmt.Errorf("at most %d buttons per slot", maxPluginSlotButton)
+		}
+	}
+	return nil
+}
+
+// FindPlugin returns the block with the given name, or nil.
+func (cfg *Config) FindPlugin(name string) *PluginConfig {
+	for i := range cfg.Plugins {
+		if cfg.Plugins[i].Name == name {
+			return &cfg.Plugins[i]
+		}
+	}
+	return nil
 }
 
 // PathsConfig holds process-wide paths. Per-gallery DB and thumbnails
@@ -378,6 +544,11 @@ type ScheduleConfig struct {
 	RemoveOrphans     bool   `toml:"remove_orphans"`
 	RunAutoTaggers    bool   `toml:"run_auto_taggers"`
 	FindRelationPairs bool   `toml:"find_relation_pairs"`
+	// The two hash-lookup phases over the images with no source (§7.13).
+	// LookupPTR reads monloader's local index in batches and costs nothing;
+	// LookupBooru spends monloader's daily budget on the online walk.
+	LookupPTR   bool `toml:"lookup_ptr"`
+	LookupBooru bool `toml:"lookup_booru"`
 }
 
 // Default returns a fully populated config with all spec defaults.
@@ -711,5 +882,29 @@ func validate(cfg *Config) error {
 	if cfg.Auth.SessionLifetimeDays <= 0 {
 		cfg.Auth.SessionLifetimeDays = defaultSessionLifetimeDays
 	}
+	dropInvalidPlugins(cfg)
 	return nil
+}
+
+// dropInvalidPlugins warns about and discards hand-written [[plugin]] blocks
+// and buttons monbooru could not render, rather than refusing to start over
+// a typo in an optional block.
+func dropInvalidPlugins(cfg *Config) {
+	cfg.Plugins = slices.DeleteFunc(cfg.Plugins, func(p PluginConfig) bool {
+		if err := ValidatePluginName(p.Name); err != nil {
+			logx.Warnf("config: dropping a [[plugin]] block: %v", err)
+			return true
+		}
+		return false
+	})
+	for i := range cfg.Plugins {
+		p := &cfg.Plugins[i]
+		p.Buttons = slices.DeleteFunc(p.Buttons, func(b PluginButton) bool {
+			if err := ValidatePluginButton(b); err != nil {
+				logx.Warnf("config: dropping a button on plugin %q: %v", p.Name, err)
+				return true
+			}
+			return false
+		})
+	}
 }

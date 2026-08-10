@@ -136,23 +136,30 @@ func SuggestUsageRanked(database *db.DB, prefix, categoryName string, requireUsa
 // requireUsage adds `usage_count > 0`.
 func suggestUsageRanked(database *db.DB, prefix, categoryName string, requireUsage bool, limit int) ([]models.Tag, error) {
 	prefix = db.EscapeLike(NormalizeTagName(prefix))
+	// The ranked pick runs against tags alone so it can ride
+	// idx_tags_active_usage and stop at the limit. With the category
+	// join in the same SELECT the planner drives from tag_categories
+	// instead, fetches every tag row through idx_tags_category and
+	// temp-sorts the lot to hand back ten.
 	baseSQL := `SELECT t.id, t.name, tc.name, tc.color, t.usage_count
-	            FROM tags t
+	            FROM (SELECT id, name, category_id, usage_count
+	                  FROM tags
+	                  WHERE is_alias = 0
+	                    %s
+	                    AND name LIKE ? ESCAPE '\'
+	                    %s
+	                  ORDER BY usage_count DESC, name ASC
+	                  LIMIT ?) t
 	            JOIN tag_categories tc ON tc.id = t.category_id
-	            WHERE t.is_alias = 0
-	              %s
-	              AND t.name LIKE ? ESCAPE '\'
-	              %s
-	            ORDER BY t.usage_count DESC, t.name ASC
-	            LIMIT ?`
+	            ORDER BY t.usage_count DESC, t.name ASC`
 	usageClause := ""
 	if requireUsage {
-		usageClause = "AND t.usage_count > 0"
+		usageClause = "AND usage_count > 0"
 	}
 	catClause := ""
 	var catArgs []any
 	if categoryName != "" {
-		catClause = "AND tc.name = ?"
+		catClause = "AND category_id = (SELECT id FROM tag_categories WHERE name = ?)"
 		catArgs = []any{categoryName}
 	}
 
@@ -162,7 +169,7 @@ func suggestUsageRanked(database *db.DB, prefix, categoryName string, requireUsa
 		qargs = append(qargs, pat)
 		qargs = append(qargs, catArgs...)
 		if nameNotLike != "" {
-			extra = extra + ` AND t.name NOT LIKE ? ESCAPE '\'`
+			extra = extra + ` AND name NOT LIKE ? ESCAPE '\'`
 			qargs = append(qargs, nameNotLike)
 		}
 		qargs = append(qargs, remaining)
@@ -207,11 +214,14 @@ func suggestUsageRanked(database *db.DB, prefix, categoryName string, requireUsa
 func (s *Service) SuggestTagsInCategory(prefix, categoryName string, limit int) ([]models.Tag, error) {
 	rows, err := s.db.Read.Query(
 		`SELECT t.id, t.name, tc.name, tc.color, t.usage_count
-		 FROM tags t
+		 FROM (SELECT id, name, category_id, usage_count
+		       FROM tags
+		       WHERE category_id = (SELECT id FROM tag_categories WHERE name = ?)
+		         AND name LIKE ? ESCAPE '\' AND is_alias = 0
+		       ORDER BY usage_count DESC
+		       LIMIT ?) t
 		 JOIN tag_categories tc ON tc.id = t.category_id
-		 WHERE tc.name = ? AND t.name LIKE ? ESCAPE '\' AND t.is_alias = 0
-		 ORDER BY t.usage_count DESC
-		 LIMIT ?`,
+		 ORDER BY t.usage_count DESC`,
 		categoryName, db.EscapeLike(NormalizeTagName(prefix))+"%", limit,
 	)
 	if err != nil {

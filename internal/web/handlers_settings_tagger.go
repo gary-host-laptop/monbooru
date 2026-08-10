@@ -154,7 +154,7 @@ func (s *Server) settingsTaggerPost(w http.ResponseWriter, r *http.Request) {
 	// the user sees any library/device issue immediately instead of waiting
 	// for a tagger run to fail. ORT env init is not re-entrant so refuse
 	// while a tagger job is holding it.
-	if newProvider != s.cfg.Tagger.ExecutionProvider {
+	if newProvider != s.executionProvider() {
 		if s.jobs.IsRunning() {
 			writeInlineFlash(w, "err", "A job is running; try again when it finishes.")
 			return
@@ -188,10 +188,10 @@ func (s *Server) settingsTaggerPost(w http.ResponseWriter, r *http.Request) {
 	if providerChanged {
 		tagger.ReleaseAll()
 	}
-	logx.Infof("settings: tagger updated (execution_provider=%s)", s.cfg.Tagger.ExecutionProvider)
+	logx.Infof("settings: tagger updated (execution_provider=%s)", newProvider)
 	writeInlineFlash(w, "ok", "Saved.")
 	s.renderTemplate(w, "partials/tagger_mode_badge.html", map[string]any{
-		"Provider": s.cfg.Tagger.ExecutionProvider,
+		"Provider": newProvider,
 		"OOB":      true,
 	})
 }
@@ -772,7 +772,7 @@ func (s *Server) settingsTaggerResetPost(w http.ResponseWriter, r *http.Request)
 // camie-v2) would otherwise resolve to a filename that doesn't exist.
 // ok=false means the tagger isn't in cfg or on disk.
 func (s *Server) resolveTaggerInstance(name string) (config.TaggerInstance, bool) {
-	for _, t := range tagger.DiscoverTaggers(s.cfg) {
+	for _, t := range tagger.DiscoverTaggers(s.cfgSnapshot()) {
 		if t.Name == name {
 			return t.TaggerInstance, true
 		}
@@ -944,7 +944,7 @@ func catalogEntryByName(modelPath, name string) *tagger.CatalogEntry {
 // off a half-broken job.
 func (s *Server) disableUnavailableTaggers() {
 	available := map[string]bool{}
-	for _, t := range tagger.DiscoverTaggers(s.cfg) {
+	for _, t := range tagger.DiscoverTaggers(s.cfgSnapshot()) {
 		available[t.Name] = t.Available
 	}
 	s.cfgMu.Lock()
@@ -973,7 +973,7 @@ func (s *Server) disableUnavailableTaggers() {
 // removes the chance of a future code path treating "no TOML entry"
 // as "not enabled".
 func (s *Server) persistNewlyDiscoveredTaggers() {
-	discovered := tagger.DiscoverTaggers(s.cfg)
+	discovered := tagger.DiscoverTaggers(s.cfgSnapshot())
 	modelPath := s.modelPath()
 	s.cfgMu.Lock()
 	known := make(map[string]bool, len(s.cfg.Tagger.Taggers))
@@ -1016,7 +1016,7 @@ func (s *Server) settingsTaggerDeletePost(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	dir := filepath.Join(s.cfg.Paths.ModelPath, name)
+	dir := filepath.Join(s.modelPath(), name)
 	s.cfgMu.Unlock()
 	// The folder goes first: dropping the entry before a removal that
 	// then fails leaves memory and the TOML disagreeing, and the next

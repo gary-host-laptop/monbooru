@@ -14,16 +14,18 @@
       </ul>
       {{else if gt .NewCount 0}}<p><span class="ptr-contrib-plus">++</span> <span class="ptr-count" title="{{.NewTip}}">{{.NewCount}}</span> of this image's tags {{if eq .NewCount 1}}is{{else}}are{{end}} new to the Public Tag Repository.</p>
       {{else if gt .PetitionCount 0}}<p><span class="ptr-contrib-minus">--</span> the Public Tag Repository holds <span class="ptr-count" title="{{.PetitionTip}}">{{.PetitionCount}}</span> tag{{if gt .PetitionCount 1}}s{{end}} this image does not carry.</p>
+      {{else if gt .UnattributedCount 0}}<p><span class="ptr-contrib-same">==</span> the Public Tag Repository holds <span class="ptr-count" title="{{.UnattributedTip}}">{{.UnattributedCount}}</span> of this image's tags without being recorded as a source for {{if eq .UnattributedCount 1}}it{{else}}them{{end}}; a pull records it.</p>
       {{else if .AllKnown}}<p class="field-hint">this image's tags are all already on the Public Tag Repository.</p>
       {{else}}<p class="field-hint">nothing to contribute for this image.</p>{{end}}
     </div>
     <div class="ptr-contrib-actions">
-      {{if and (gt .PetitionCount 0) .CanPull}}
+      {{if .CanPull}}
       <button type="button" class="btn-ptr-pull monloader-accent"
               hx-post="/images/{{.ImageID}}/lookup" hx-vals='{"backend":"ptr"}'
               hx-target="#fetch-pending" hx-swap="innerHTML"
               hx-headers='{"X-CSRF-Token":"{{.CSRFToken}}"}'
               hx-confirm="Pull this file's tags from the Public Tag Repository?"
+              title="Add the tags it holds and record it as a source for the ones this image already carries"
               data-confirm-ok="Pull tags">Pull tags</button>
       {{end}}
       <button type="button" class="btn-ptr-contribute"

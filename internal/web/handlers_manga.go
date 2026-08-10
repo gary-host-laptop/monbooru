@@ -43,10 +43,9 @@ type pagesGridData struct {
 	Image        models.Image
 	Filename     string
 	PageCount    int
-	LastReadPage int               // resume bookmark, 0 when unstarted or finished
-	ImageTags    []models.ImageTag // populates the per-image sidebar tag list, mirroring detail.html
-	Aliases      []models.Tag      // alias rows pointing at any non-implied tag on this image
-	BackQuery    string            // raw back_q used by the sidebar-browse render
+	LastReadPage int        // resume bookmark, 0 when unstarted or finished
+	TagSidebar   tagSidebar // the per-image sidebar tag listing, same shape detail.html renders
+	BackQuery    string     // raw back_q used by the sidebar-browse render
 	BackQS       template.URL
 	BackKVQS     template.URL
 }
@@ -187,14 +186,14 @@ func (s *Server) pagesGridHandler(w http.ResponseWriter, r *http.Request) {
 	// not back on the grid.
 	backQS, backKVQS := back.ReaderQS(false)
 	_, imageTags, _ := s.tagSvc().GetImageTags(img.ID)
+	base := s.base(r, "gallery", filepath.Base(img.CanonicalPath)+" - Pages - "+s.booruName())
 	data := pagesGridData{
-		baseData:     s.base(r, "gallery", filepath.Base(img.CanonicalPath)+" - Pages - "+s.booruName()),
+		baseData:     base,
 		Image:        *img,
 		Filename:     filepath.Base(img.CanonicalPath),
 		PageCount:    *img.PageCount,
 		LastReadPage: resumePage(img),
-		ImageTags:    imageTags,
-		Aliases:      s.aliasesForImageTags(imageTags),
+		TagSidebar:   s.buildTagSidebar(img.ID, base.CSRFToken, readTagModeCookie(r), imageTags),
 		BackQuery:    back.Q,
 		BackQS:       backQS,
 		BackKVQS:     backKVQS,
@@ -220,13 +219,12 @@ func (s *Server) extractMangaPage(w http.ResponseWriter, r *http.Request) {
 		logx.Warnf("extract page %d of image %d: %s: %v", n, img.ID, stage, err)
 		http.Error(w, "Could not extract this page.", http.StatusInternalServerError)
 	}
-
-	pagePath, err := gallery.EnsureMangaPage(s.thumbnailsPath(), img.CanonicalPath, img.ID, n)
-	if err != nil {
-		fail("extract", err)
+	cx := s.Active()
+	if cx == nil {
+		fail("gallery", fmt.Errorf("no active gallery"))
 		return
 	}
-	destDir, err := gallery.ResolveSubdir(s.galleryPath(), s.cfg.Gallery.DefaultUploadFolder)
+	destDir, err := gallery.ResolveSubdir(cx.GalleryPath, s.defaultUploadFolder())
 	if err != nil {
 		fail("resolve folder", err)
 		return
@@ -237,51 +235,15 @@ func (s *Server) extractMangaPage(w http.ResponseWriter, r *http.Request) {
 	}
 	stem := strings.TrimSuffix(filepath.Base(img.CanonicalPath), filepath.Ext(img.CanonicalPath))
 	// Copy rather than move: the cache file belongs to the manga reclaim
-	// goroutine, which is free to unlink it at any point.
-	dstPath := gallery.UniqueDestPath(destDir, fmt.Sprintf("%s_p%04d%s", stem, n, filepath.Ext(pagePath)))
-	if err := copyFileContents(pagePath, dstPath); err != nil {
-		fail("copy page", err)
-		return
-	}
-	if _, err := gallery.DetectFileType(dstPath); err != nil {
-		_ = os.Remove(dstPath)
-		fail("detect type", err)
-		return
-	}
-	// No MaxFileSizeMB check: the bytes are already in the library, inside
-	// the archive.
-	page, isDup, err := gallery.Ingest(s.db(), s.galleryPath(), s.thumbnailsPath(), dstPath, models.OriginExtract)
+	// goroutine, which is free to unlink it at any point. The helper
+	// extracts, ingests and links the page exactly as this button did.
+	pageID, err := s.extractMangaPageToGallery(cx, img, n, destDir, stem+"_p")
 	if err != nil {
-		_ = os.Remove(dstPath)
-		fail("ingest", err)
+		fail("extract", err)
 		return
 	}
-	if isDup {
-		// Same unwind as the upload drop zone: the bytes already live in
-		// the gallery, so the fresh copy and the alias ingest recorded for
-		// it are dead weight.
-		if _, delErr := s.db().Write.Exec(
-			`DELETE FROM image_paths WHERE image_id = ? AND path = ? AND is_canonical = 0`,
-			page.ID, dstPath,
-		); delErr != nil {
-			logx.Warnf("extract: drop duplicate alias for %q: %v", dstPath, delErr)
-		}
-		if rmErr := os.Remove(dstPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			logx.Warnf("extract: remove duplicate copy %q: %v", dstPath, rmErr)
-		}
-	}
-	if cx := s.Active(); cx != nil {
-		if cx.RelationsSvc != nil {
-			// A conflicting relation or an existing source on the page row
-			// is a standing operator decision, so the link is skipped and
-			// the extract still stands.
-			if err := cx.RelationsSvc.AddDerivativeEdge(img.ID, page.ID); err != nil {
-				logx.Debugf("extract: link %d -> %d skipped: %v", img.ID, page.ID, err)
-			}
-		}
-		cx.InvalidateCaches()
-	}
-	http.Redirect(w, r, fmt.Sprintf("/images/%d", page.ID), http.StatusSeeOther)
+	cx.InvalidateCaches()
+	http.Redirect(w, r, fmt.Sprintf("/images/%d", pageID), http.StatusSeeOther)
 }
 
 // loadMangaMeta reads the manga_metadata row for an image, or nil when

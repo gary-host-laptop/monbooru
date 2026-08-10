@@ -52,7 +52,7 @@
         <tr>
           <td>
             <input type="hidden" name="category" value="{{.Category}}">
-            <span style="color:{{.Color}}">{{.Category}}</span>
+            <span style="color:{{catColor .Color}}">{{.Category}}</span>
             {{if .ViaRules}}<span class="field-hint">via rules</span>{{end}}
           </td>
           <td>

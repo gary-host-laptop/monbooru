@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/models"
@@ -40,6 +41,7 @@ type Query struct {
 
 // Execute runs the query against the DB and returns paginated results.
 func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
+	started := time.Now()
 	page := max(q.Page, 1)
 	limit := q.Limit
 	if limit < 1 {
@@ -134,12 +136,15 @@ func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
 	// cannot stand behind.
 	if q.Sort == "similarity" && hasRankSeed && q.CacheKey != "" &&
 		!q.SkipCount && q.PresetTotal == nil && AdjacencyCacheTryAcquireFan(q.CacheKey) {
-		ids := fanSimilarityIDs(context.Background(), database, rankSeed, q.Order, where, args)
+		ctx, cancel := context.WithTimeout(context.Background(), fanBudget(time.Since(started)))
+		ids := fanSimilarityIDs(ctx, database, rankSeed, q.Order, where, args)
+		cancel()
 		AdjacencyCacheReleaseFan(q.CacheKey)
 		if len(ids) > 0 && len(ids) < adjacencyCacheMaxIDs {
 			AdjacencyCacheSet(q.CacheKey, ids)
 			return executeFromCachedIDs(database, ids, page, limit)
 		}
+		AdjacencyCacheMarkFanOverBudget(q.CacheKey)
 	}
 
 	offset := (page - 1) * limit
@@ -228,9 +233,10 @@ func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
 	// look faster on a one-shot bench, but the very next request (the
 	// real-user page-flip or detail prev/next) raced the fan and missed
 	// the cache. The synchronous fan adds one id-only cursor walk to
-	// the page-1 wall, capped at adjacencyCacheMaxIDs and read off the
-	// read pool. Pages > 1 still skip the fan because the cache either
-	// settled on page 1's request or the operator jumped past it.
+	// the page-1 wall, capped at adjacencyCacheMaxIDs and bounded by
+	// adjacencyFanBudget so an expensive per-row predicate can't hold
+	// the request. Pages > 1 still skip the fan because the cache
+	// either settled on page 1's request or the operator jumped past it.
 	//
 	// The recent-id bound holds only for the rows this page needs, so
 	// the fan rebuilds the WHERE without it - caching the bounded slice
@@ -255,12 +261,16 @@ func Execute(database *db.DB, q Query) (*models.SearchResult, error) {
 				fanWhere, fanArgs = applyAndDriver(fanWhere, fanArgs, driverLegs)
 				fanWhere = andDefaultVisible(fanWhere, hasMissingFilter)
 			}
-			ids := fetchSortedMatchIDs(context.Background(), database, indexHint, fanWhere, fanArgs, orderClause, orderArgs, total)
+			ctx, cancel := context.WithTimeout(context.Background(), fanBudget(time.Since(started)))
+			ids := fetchSortedMatchIDs(ctx, database, indexHint, fanWhere, fanArgs, orderClause, orderArgs, total)
+			cancel()
 			if len(ids) > 0 {
 				AdjacencyCacheSet(q.CacheKey, ids)
 				if len(ids) < min(total, adjacencyCacheMaxIDs) {
 					total = len(ids)
 				}
+			} else {
+				AdjacencyCacheMarkFanOverBudget(q.CacheKey)
 			}
 		}
 	}
@@ -328,9 +338,9 @@ func executeFromCachedIDs(database *db.DB, ids []int64, page, limit int) (*model
 // Used by Execute to seed the cache when total exceeds a single page,
 // so subsequent page-flips and detail prev/next ride the cache. Errors
 // degrade to a nil slice; the caller skips populate and the next render
-// retries.
-// ctx bounds the fan for callers that render behind a deadline; Execute
-// has none to hand down and passes a background context.
+// retries. A cancelled ctx lands there too, so an over-budget fan never
+// caches the prefix it managed to read - a truncated list would report a
+// shrunken total and cut prev/next off mid-set.
 func fetchSortedMatchIDs(ctx context.Context, database *db.DB, indexHint, where string, args []any, orderClause string, orderArgs []any, total int) []int64 {
 	n := min(total, adjacencyCacheMaxIDs)
 	sql := fmt.Sprintf(
@@ -446,9 +456,8 @@ func collectionCursor(pos sql.NullInt64, id int64, desc bool) (before, after, fw
 // share before their direction-specific SQL: the resolved WHERE (driver
 // legs applied, default-visible folded in, bucket bound appended), the
 // pure-folder legs, the sort key, and the before/after comparisons. The
-// callers' deltas stay explicit at the call sites: RankInQuery picks its
-// driver with allowSingleLiteral=true, never buckets, and walks only the
-// before direction.
+// callers' deltas stay explicit at the call sites: RankInQuery never
+// buckets and walks only the before direction.
 type adjacencyPlan struct {
 	where        string
 	args         []any
@@ -720,15 +729,14 @@ func ExecuteAdjacent(ctx context.Context, database *db.DB, q Query, currentID in
 // WHERE shape Execute uses. Callers turn the rank into a 1-indexed
 // page via floor(rank / pageSize) + 1. Use it as a cold-path fallback
 // for the detail handler's back-link page when AdjacencyCacheGet
-// misses; warm calls should hit the cache and skip this helper. Cost
-// scales with the WHERE's match cardinality, so spawn it in parallel
-// with other detail reads and pass a deadline-bound context - on a
-// large fixture a popular-tag back_q can otherwise pin the COUNT for
-// seconds while the user waits on the page.
+// misses; warm calls should hit the cache and skip this helper. The
+// count stops at rankInQueryMaxRank, but a sparse predicate can walk a
+// long way to reach that many rows, so spawn it in parallel with other
+// detail reads and pass a deadline-bound context.
 //
 // Returns (-1, nil) when the helper can't usefully answer (random
-// sort with seed=0, ctx cancelled). The caller degrades to whatever
-// back_page came in on the URL.
+// sort with seed=0, ctx cancelled, a rank past rankInQueryMaxRank).
+// The caller degrades to whatever back_page came in on the URL.
 func RankInQuery(ctx context.Context, database *db.DB, q Query, currentID int64) (int, error) {
 	// Similarity ranks off the same position scan prev/next uses; the
 	// cursor COUNT below has no score column to compare against.
@@ -741,23 +749,17 @@ func RankInQuery(ctx context.Context, database *db.DB, q Query, currentID int64)
 		return -1, nil
 	}
 
-	// Skip when the rank COUNT would walk a popular-tag candidate set
-	// large enough to peg the ctx ceiling. The COUNT cursor walks every
-	// matched row newer-than-currentID; for a 50 k-row materialised
-	// set the natural cost lands near the 500 ms budget even with the
-	// AND-driver inline, so the handler falls back to the URL's
-	// back_page rather than blocking the page render.
-	if total, ok := fastTagTotal(database, q.Expr); ok && total > rankInQueryCountSkip {
-		return -1, nil
+	// A single leaf keeps its driver until it is popular enough that
+	// materialising every row it carries costs more than the cursor's
+	// walk over the rows above currentID - the walk the LIMIT below
+	// bounds, and what the materialisation used to stand in for. Random
+	// sort keeps it either way: its key has no index for the cursor to
+	// ride.
+	allowSingle := q.Sort == "random"
+	if total, ok := fastTagTotal(database, q.Expr); !ok || total <= fastApproxThreshold {
+		allowSingle = true
 	}
-
-	// allowSingleLiteral=true regardless of sort: this COUNT has no
-	// LIMIT to short-circuit the per-row EXISTS scan a single-literal
-	// at root would otherwise pay. Execute and ExecuteAdjacent gate on
-	// random sort because the planner's default newest-sort plan
-	// terminates at LIMIT; here the cursor walks newer-than-current
-	// rows to completion.
-	driverLegs, _ := pickAndDriverTag(database, q.Expr, true)
+	driverLegs, _ := pickAndDriverTag(database, q.Expr, allowSingle)
 
 	// The rank counts the rows before currentID, so only the plan's prev
 	// comparison is consumed; no bucket gate, the COUNT must see the whole
@@ -770,35 +772,39 @@ func RankInQuery(ctx context.Context, database *db.DB, q Query, currentID int64)
 		return -1, nil
 	}
 
-	var sql string
+	var rows string
 	var qargs []any
 	if p.collOrder {
-		sql = fmt.Sprintf(
-			"SELECT COUNT(*) FROM images i JOIN image_collections pc ON pc.image_id = i.id AND pc.name = ? WHERE %s AND %s",
+		rows = fmt.Sprintf(
+			"SELECT 1 FROM images i JOIN image_collections pc ON pc.image_id = i.id AND pc.name = ? WHERE %s AND %s",
 			p.where, p.prevCmp)
 		qargs = slices.Concat([]any{q.OrderCollection}, p.args, p.prevArgs)
 	} else if p.folderActive {
 		legSQL := "SELECT 1 FROM images i INDEXED BY idx_images_folder_nocase_visible WHERE %s AND " + p.where + " AND " + p.prevCmp
-		sql = "SELECT COUNT(*) FROM (" +
-			fmt.Sprintf(legSQL, "i.folder_path = ? COLLATE NOCASE") +
+		rows = fmt.Sprintf(legSQL, "i.folder_path = ? COLLATE NOCASE") +
 			" UNION ALL " +
-			fmt.Sprintf(legSQL, "i.folder_path >= ? COLLATE NOCASE AND i.folder_path < ? COLLATE NOCASE") +
-			")"
+			fmt.Sprintf(legSQL, "i.folder_path >= ? COLLATE NOCASE AND i.folder_path < ? COLLATE NOCASE")
 		qargs = slices.Concat(
 			[]any{p.folderEq}, p.args, p.prevArgs,
 			[]any{p.folderLo, p.folderHi}, p.args, p.prevArgs,
 		)
 	} else {
-		sql = fmt.Sprintf(
-			"SELECT COUNT(*) FROM images i%s WHERE %s AND %s",
+		rows = fmt.Sprintf(
+			"SELECT 1 FROM images i%s WHERE %s AND %s",
 			p.indexHint, p.where, p.prevCmp,
 		)
 		qargs = slices.Concat(p.args, p.prevArgs)
 	}
 
 	var rank int
-	if err := database.Read.QueryRowContext(ctx, sql, qargs...).Scan(&rank); err != nil {
+	if err := database.Read.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM ("+rows+" LIMIT ?)",
+		append(qargs, rankInQueryMaxRank+1)...,
+	).Scan(&rank); err != nil {
 		return -1, err
+	}
+	if rank > rankInQueryMaxRank {
+		return -1, nil
 	}
 	return rank, nil
 }

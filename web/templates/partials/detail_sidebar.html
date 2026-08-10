@@ -1,27 +1,85 @@
 {{define "partials/detail_sidebar.html"}}
-  {{if .ImageTags}}
+  {{with .TagSidebar}}{{$sb := .}}
+  {{if .ImageID}}
   <div id="tags-section">
     <div class="sidebar-section-header">
       <span class="sidebar-section-title">Tags</span>
       <button id="tags-toggle" class="folder-toggle-btn" data-target="tag-groups">▼</button>
     </div>
-    <div id="tag-groups" class="detail-tag-groups">
-      {{range groupByImageTags .ImageTags}}
-      <div class="tag-group">
-        <div class="tag-category-label" style="color:{{.Color}}">{{.Name}}</div>
+    <div id="tag-groups" class="detail-tag-groups" data-mode="{{.Mode}}">
+      {{if .Sections}}
+      <div class="tag-mode-switch">
+        {{if eq .Mode "category"}}<span class="tag-mode-current">[categories]</span>
+        {{else}}<button type="button" class="tag-mode-toggle"
+                hx-get="/images/{{.ImageID}}/tags?tagmode=category"
+                hx-target="#image-tags" hx-swap="outerHTML"
+                title="Group by category">[categories]</button>{{end}}
+        <span class="tag-mode-sep">/</span>
+        {{if eq .Mode "source"}}<span class="tag-mode-current">[sources]</span>
+        {{else}}<button type="button" class="tag-mode-toggle"
+                hx-get="/images/{{.ImageID}}/tags?tagmode=source"
+                hx-target="#image-tags" hx-swap="outerHTML"
+                title="Group by the sources that applied each tag">[sources]</button>{{end}}
+      </div>
+      {{end}}
+      {{if not .Sections}}<div class="no-tags">No tags yet.</div>{{end}}
+      {{range .Sections}}
+      <div class="tag-group" data-cat="{{.Name}}">
+        <div class="tag-category-label">
+          <span class="tag-group-name"{{if .Color}} style="color:{{catColor .Color}}"{{end}}>{{.Name}}</span>
+          {{if .DeleteURL}}
+          <button type="button" class="tag-group-delete"
+                  hx-delete="{{.DeleteURL}}"
+                  hx-target="#image-tags"
+                  hx-swap="outerHTML"
+                  hx-headers='{"X-CSRF-Token":"{{$sb.CSRFToken}}"}'
+                  {{if eq $sb.Mode "source"}}
+                  hx-confirm="Drop {{.Name}} from the {{.DeleteCount}} tags it applied?{{if .DeleteShared}} {{.DeleteShared}} that another source also vouches for stay on the image.{{end}}"
+                  title="Withdraw {{.Name}} from this image's tags"
+                  {{else}}
+                  hx-confirm="Remove the {{.DeleteCount}} {{.Name}} tags on this image?"
+                  title="Remove every {{.Name}} tag on this image"
+                  {{end}}
+                  data-confirm-ok="{{if eq $sb.Mode "source"}}Drop{{else}}Remove{{end}}">[x]</button>
+          {{end}}
+        </div>
         <ul class="tag-list-sidebar">
-          {{range .Tags}}
-          <li class="tag-entry {{if .IsAuto}}tag-auto-entry{{end}}" data-name="{{.TagName}}">
-            {{if .IsAuto}}<span class="auto-dot" title="auto-tagged">·</span>{{else}}<span class="auto-dot-spacer"></span>{{end}}
-            <a href="/?q={{.Category}}:{{.TagName}}" class="tag-link" style="color:{{.Color}}">{{.TagName}}</a>
-            <span class="tag-count">{{.UsageCount}}</span>
+          {{range .Rows}}
+          <li class="tag-entry{{if not .Removable}} tag-entry-implied{{end}}{{if .Stale}} tag-entry-stale{{end}}"
+              data-name="{{.TagName}}" data-tag-id="{{.TagID}}" data-source="{{.Source}}" data-depth="{{.Depth}}">
+            {{if .Removable}}
+            <button type="button" class="tag-entry-remove"
+                    hx-delete="{{.RemoveURL}}"
+                    hx-target="#image-tags"
+                    hx-swap="outerHTML"
+                    hx-headers='{"X-CSRF-Token":"{{$sb.CSRFToken}}"}'
+                    title="{{if eq $sb.Mode "source"}}Drop this source's claim on the tag{{else}}Remove tag{{end}}">[x]</button>
+            {{else}}<span class="tag-entry-branch">└</span>{{end}}
+            <a href="/?q={{.Category}}:{{.TagName}}" class="tag-link" style="color:{{catColor .Color}}"
+               title="{{.NameHint}}">{{.TagName}}</a>
+            {{if .Marker}}<span class="tag-marker tag-marker-{{.MarkerKind}}"{{if .MarkerHint}} title="{{.MarkerHint}}"{{end}}>{{.Marker}}</span>{{end}}
+            <span class="tag-count" title="images in the library with this tag">{{.UsageCount}}</span>
           </li>
           {{end}}
         </ul>
       </div>
       {{end}}
     </div>
+    {{if .StaleCount}}
+    <div class="tag-stale-footer">
+      <span>{{.StaleCount}} stale tag{{if ne .StaleCount 1}}s{{end}}</span>
+      <button type="button" class="tag-group-delete"
+              hx-delete="/images/{{$sb.ImageID}}/stale-tags"
+              hx-target="#image-tags"
+              hx-swap="outerHTML"
+              hx-headers='{"X-CSRF-Token":"{{$sb.CSRFToken}}"}'
+              hx-confirm="Remove the {{.StaleCount}} stale tag{{if ne .StaleCount 1}}s{{end}} on this image?"
+              data-confirm-ok="Remove"
+              title="Remove every tag the sources stopped carrying">[remove all]</button>
+    </div>
+    {{end}}
   </div>
+  {{end}}
   {{end}}
 
   {{/* Folder tree, source filters, and saved searches. Lazy-loaded so the

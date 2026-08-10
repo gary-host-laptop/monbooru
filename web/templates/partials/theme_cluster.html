@@ -1,0 +1,11 @@
+{{define "partials/theme_cluster.html"}}
+<div id="theme-cluster" class="theme-cluster">
+  {{$csrf := .CSRFToken}}{{$active := .Active}}
+  <span class="field-hint">theme:</span>
+  {{range $i, $n := .Names}}{{if $i}}<span class="footer-sep">·</span>{{end}}{{if eq $n $active}}<span class="theme-cluster-active">[{{$n}}]</span>{{else}}<form hx-post="/settings/plugins/theme" hx-swap="none" style="display:inline">
+    <input type="hidden" name="_csrf" value="{{$csrf}}">
+    <input type="hidden" name="theme" value="{{$n}}">
+    <button type="submit">{{$n}}</button>
+  </form>{{end}}{{end}}
+</div>
+{{end}}

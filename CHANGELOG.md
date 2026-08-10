@@ -1,5 +1,41 @@
 # Changelog
 
+## [v1.18.0] - 2026-08-10
+### Added
+- Plugin support with buttons on the image and batch surfaces. Drop a plugin folder in config/plugins/ and monbooru launches and supervises it.   ([#78](https://github.com/monbooru/monbooru/issues/78))
+- Switchable themes in the settings, including a default light theme. Drop a theme folder in config/themes/ to add a new one. ([#102](https://github.com/monbooru/monbooru/issues/102))
+- Scheduled job to lookup unsourced images up against the PTR and the online boorus lookup list via monloader. ([#65](https://github.com/monbooru/monbooru/issues/65))
+- Pack a collection into a cbz archive, or unpack an archive back into a collection. ([#77](https://github.com/monbooru/monbooru/issues/77))
+- `lookup:` filters by what the nightly run has tried, with a per-image switch.
+- The file watcher catches a file edited in place, keeping the image's tags.
+
+### Changed
+- An image's tags now list in the detail sidebar, grouped by category or by source. ([#106](https://github.com/monbooru/monbooru/issues/106))
+- Removing a tag in the sidebar's sources view withdraws that source's claim.
+- The detail image is sized so the tag input stays visible without scrolling on medium sized screens.
+- Batch Find-tags dialog overhaul.
+- The Tags page and tag autocomplete are faster on large catalogs.
+- A first search on a large library no longer stalls caching the whole match set.
+
+### Fixed
+- A wildcard search no longer reports more matches than the library holds.
+- Downloads keep the file's name on disk instead of naming it after its type. ([#75](https://github.com/monbooru/monbooru/issues/75))
+- An image too large for a browser to decode is served as a bounded rendition. ([#99](https://github.com/monbooru/monbooru/issues/99))
+- A batch action keeps the selection across the reload it ends in.
+- Autocomplete dropdowns close on a cleared input instead of reappearing.
+- The batch bar keeps its layout when it wraps to a second row.
+- The login page loads the custom stylesheet and logo.
+- Deleting a tag category names the tags that collide and refuses rating as the target.
+- A peer that lost its credentials can pair again instead of being refused.
+
+See https://github.com/monbooru/monbooru-plugins for the plugins and theme repository.
+
+Thanks to @QiE2035 for the suggestions (https://github.com/monbooru/monbooru/issues/78, https://github.com/monbooru/monbooru/issues/102).
+Thanks to @gary-host-laptop for the feature (https://github.com/monbooru/monbooru/issues/77), the fix (https://github.com/monbooru/monbooru/issues/98), the suggestions (https://github.com/monbooru/monbooru/issues/65, https://github.com/monbooru/monbooru/issues/106) and bug report (https://github.com/monbooru/monbooru/issues/99).
+Thanks to @CeareDelafont for the suggestions (https://github.com/monbooru/monbooru/issues/77, https://github.com/monbooru/monbooru/issues/75).
+
+Co-authored-by: gary-host-laptop <github.striven@aleeas.com>
+
 ## [v1.17.1] - 2026-08-04
 ### Added
 - `[review again]` appears on every edge of a relation chain or tree, not just on a pair.

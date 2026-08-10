@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -26,6 +27,7 @@ import (
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/search"
 	"github.com/monbooru/monbooru/internal/tagger"
+	"github.com/monbooru/monbooru/internal/tags"
 	webFS "github.com/monbooru/monbooru/web"
 )
 
@@ -60,28 +62,6 @@ type tagGroup struct {
 	Tags  []models.Tag
 }
 
-// imageTagGroup is used by the groupByImageTags template function.
-type imageTagGroup struct {
-	Name  string
-	Color string
-	Tags  []models.ImageTag
-}
-
-// imageTagSourceGroup is used by the groupByImageSource template function
-// which splits the detail-page tag list into subsections by origin:
-// manual ("user") and one group per distinct auto-tagger name.
-type imageTagSourceGroup struct {
-	Source string // "user" or tagger name
-	// Kind tells the template which bulk-remove route covers the group:
-	// "user", "source" or "auto". Empty when no route can target it, which
-	// Source alone can't express (a source labelled "user", an auto group
-	// whose rows carry no tagger name).
-	Kind  string
-	Title string
-	Stale bool // the source's latest fetch no longer carried these tags
-	Tags  []models.ImageTag
-}
-
 // Server holds all shared state for the HTTP server.
 type Server struct {
 	cfg        *config.Config
@@ -114,6 +94,12 @@ type Server struct {
 	schedLastRun  time.Time
 	schedLastDur  time.Duration
 	schedLastInfo string // "OK" or a short failure summary; empty when never run
+	// schedLookupInfo is what the last run's lookup phases found, one line
+	// per phase and gallery; the run-level info above cannot carry it.
+	schedLookupInfo []string
+	// schedGalleryOffset is where the next run starts in the gallery list,
+	// so a budget too small for the first gallery cannot starve the rest.
+	schedGalleryOffset int
 
 	// monloaderStatusMu guards the cached footer-light probe result. base()
 	// seeds every page's initial render from it so the light shows its last
@@ -129,6 +115,23 @@ type Server struct {
 	monloaderContribBanned bool
 	monloaderContribFailed int
 	monloaderCheckedAt     time.Time
+
+	// themeWarnMu guards themeWarned, the last unresolvable server.theme
+	// value reported. Theme resolution runs on every render, so the warning
+	// is deduped rather than repeated per page.
+	themeWarnMu sync.Mutex
+	themeWarned string
+
+	// managedMu guards managed, the supervised child process of every
+	// [[plugin]] block carrying a command line.
+	managedMu sync.Mutex
+	managed   map[string]*managedPlugin
+
+	// pluginProbeMu guards pluginProbes, one cached /health result per paired
+	// plugin. Button rendering gates on it, so a peer that went away stops
+	// offering surfaces that would only fail.
+	pluginProbeMu sync.Mutex
+	pluginProbes  map[string]pluginProbe
 
 	// fetchStatusMu guards fetchStatus, the last-known outcome of each image's
 	// source metadata fetch. monloader runs the fetch asynchronously and calls
@@ -155,20 +158,22 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager) 
 	}
 
 	s := &Server{
-		cfg:         cfg,
-		configPath:  configPath,
-		jobs:        jobManager,
-		pairs:       newPairStore(),
-		sessions:    sessions,
-		loginRL:     newLoginRateLimiter(),
-		csrfSecret:  mustRandBytes(32),
-		tmpl:        tmpl,
-		staticFS:    staticFS,
-		done:        make(chan struct{}),
-		schedReload: make(chan struct{}, 1),
-		contexts:    map[string]*galleryCtx{},
-		activeName:  cfg.DefaultGallery,
-		fetchStatus: map[string]fetchStatusEntry{},
+		cfg:          cfg,
+		configPath:   configPath,
+		jobs:         jobManager,
+		pairs:        newPairStore(),
+		sessions:     sessions,
+		loginRL:      newLoginRateLimiter(),
+		csrfSecret:   mustRandBytes(32),
+		tmpl:         tmpl,
+		staticFS:     staticFS,
+		done:         make(chan struct{}),
+		schedReload:  make(chan struct{}, 1),
+		contexts:     map[string]*galleryCtx{},
+		activeName:   cfg.DefaultGallery,
+		fetchStatus:  map[string]fetchStatusEntry{},
+		pluginProbes: map[string]pluginProbe{},
+		managed:      map[string]*managedPlugin{},
 	}
 
 	applyRelationsConfig(cfg.Relations)
@@ -201,6 +206,10 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager) 
 			s.cfg.Server.BooruLogo = ""
 		}
 	}
+	if cfg.Server.ThemeColor != "" && !tags.IsValidCategoryColor(cfg.Server.ThemeColor) {
+		logx.Warnf("server.theme_color %q is not a #rgb / #rrggbb colour; the bundled palette is used", cfg.Server.ThemeColor)
+		s.cfg.Server.ThemeColor = ""
+	}
 
 	// Periodically sweep expired sessions and login rate-limiter entries.
 	go func() {
@@ -221,6 +230,11 @@ func NewServer(cfg *config.Config, configPath string, jobManager *jobs.Manager) 
 
 	// Daily scheduled maintenance runs driven by cfg.Schedule.
 	go s.runScheduler()
+
+	go s.runPluginProbes()
+	s.seedThemesDir()
+	s.ensurePluginsDir()
+	s.startManagedPlugins()
 
 	return s, nil
 }
@@ -264,6 +278,7 @@ func (s *Server) runMemoryReclaim() {
 			}
 			search.AdjacencyCacheSweep()
 			s.pruneFetchStatus()
+			s.reconcileAllLookups()
 			debug.FreeOSMemory()
 			s.cfgMu.Lock()
 			mins := s.cfg.Tagger.IdleReleaseAfterMinutes
@@ -316,7 +331,7 @@ func (s *Server) ContextMiddleware(next http.Handler) http.Handler {
 
 func contextMiddlewareBypass(path string) bool {
 	switch path {
-	case "/internal/gallery/switch", "/custom.css", "/custom.logo", "/manifest.json":
+	case "/internal/gallery/switch", "/custom.css", "/custom.logo", "/theme.css", "/theme.logo", "/manifest.json":
 		return true
 	}
 	if strings.HasPrefix(path, "/i/") {
@@ -325,9 +340,13 @@ func contextMiddlewareBypass(path string) bool {
 		// read lock.
 		return true
 	}
-	if path == "/internal/monloader-status" || path == "/internal/monloader/disconnect" || path == "/internal/monloader/reconnect" || strings.HasPrefix(path, "/settings/monloader/pair") {
-		// These poll / probe monloader over HTTP and touch no gallery context;
+	if path == "/internal/monloader-status" || path == "/internal/monloader/disconnect" || path == "/internal/monloader/reconnect" ||
+		path == "/internal/plugin/relay" || strings.HasPrefix(path, "/settings/plugins/") ||
+		strings.HasPrefix(path, pluginMountPrefix) {
+		// These poll / probe a peer over HTTP and touch no gallery context;
 		// holding the read lock across the outbound call would stall a switch.
+		// The plugin mount is the longest of them: a peer's page is served for
+		// as long as the peer takes to serve it.
 		return true
 	}
 	if (strings.HasPrefix(path, "/images/") || strings.HasPrefix(path, "/tags/")) &&
@@ -371,6 +390,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.staticFS))))
 	mux.HandleFunc("GET /custom.css", s.serveCustomCSS)
 	mux.HandleFunc("GET /custom.logo", s.serveCustomLogo)
+	mux.HandleFunc("GET /theme.css", s.serveThemeCSS)
+	mux.HandleFunc("GET /theme.logo", s.serveThemeLogo)
 	mux.HandleFunc("GET /manifest.json", s.manifestHandler)
 	mux.HandleFunc("GET /thumbnails/{gallery}/{file}", s.serveThumbnail)
 	// Fallback icon for tabs with no <link rel="icon"> (a raw image opened
@@ -402,9 +423,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /images/{id}", s.detailHandler)
 	mux.HandleFunc("GET /images/{id}/related", s.relatedImagesHandler)
 	mux.HandleFunc("GET /images/{id}/file", s.serveImageFile)
+	mux.HandleFunc("GET /images/{id}/view", s.serveImageView)
 	mux.HandleFunc("GET /images/{id}/page/{n}", s.serveMangaPage)
 	mux.HandleFunc("GET /images/{id}/page/{n}/thumb", s.serveMangaPageThumb)
 	mux.HandleFunc("POST /images/{id}/page/{n}/extract", s.extractMangaPage)
+	mux.HandleFunc("POST /images/{id}/generate-collection", s.generateMangaCollection)
 	mux.HandleFunc("GET /images/{id}/read", s.readerHandler)
 	mux.HandleFunc("GET /images/{id}/pages", s.pagesGridHandler)
 	mux.HandleFunc("POST /images/{id}/tags", s.addTagToImage)
@@ -413,6 +436,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /images/{id}/auto-tags", s.removeAutoTagsFromImageHandler)
 	mux.HandleFunc("DELETE /images/{id}/source-tags", s.removeSourceTagsFromImageHandler)
 	mux.HandleFunc("DELETE /images/{id}/stale-tags", s.removeStaleTagsFromImageHandler)
+	mux.HandleFunc("DELETE /images/{id}/category-tags", s.removeCategoryTagsFromImageHandler)
+	mux.HandleFunc("DELETE /images/{id}/source-contribution", s.dropSourceContributionHandler)
 	mux.HandleFunc("DELETE /images/{id}/tags/{tagID}", s.removeTagFromImage)
 	mux.HandleFunc("POST /images/{id}/favorite", s.toggleFavorite)
 	mux.HandleFunc("POST /images/{id}/inbox", s.toggleInbox)
@@ -430,6 +455,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /images/{id}/ptr-contrib-dialog", s.ptrContribDialog)
 	mux.HandleFunc("POST /images/{id}/ptr-contrib", s.ptrContribSend)
 	mux.HandleFunc("POST /images/{id}/note", s.setNote)
+	mux.HandleFunc("POST /internal/batch-lookup/count", s.batchLookupCount)
+	mux.HandleFunc("POST /images/{id}/scheduled-lookup", s.scheduledLookupPost)
+	mux.HandleFunc("POST /images/{id}/scheduled-lookup/reset", s.scheduledLookupResetPost)
 	mux.HandleFunc("POST /images/{id}/commentary/set", s.setSourceCommentary)
 	mux.HandleFunc("POST /images/{id}/commentary/remove", s.removeSourceCommentary)
 	mux.HandleFunc("POST /images/{id}/original/set", s.setSourceOriginal)
@@ -475,6 +503,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /collections/find-relations", s.collectionFindRelationsPost)
 	mux.HandleFunc("GET /collections/order", s.collectionOrderDialog)
 	mux.HandleFunc("POST /collections/order", s.reorderCollectionPost)
+	mux.HandleFunc("POST /collections/generate-cbz", s.generateCollectionCBZ)
 
 	mux.HandleFunc("GET /categories", s.categoriesHandler)
 
@@ -495,6 +524,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /settings/maintenance/recalc-tags", s.recalcTagsPost)
 	mux.HandleFunc("POST /settings/maintenance/tag-conflicts", s.tagCategoryConflictsPost)
 	mux.HandleFunc("POST /settings/maintenance/find-folded-duplicates", s.findFoldedDuplicatesPost)
+	mux.HandleFunc("POST /settings/maintenance/lookup-due", s.lookupDuePost)
 	// Relocated to /relations/file-duplicates/* in v1.8; old routes
 	// stay alive as 301 redirects for one release so bookmarks survive.
 	mux.HandleFunc("GET /settings/maintenance/duplicates-list", func(w http.ResponseWriter, r *http.Request) {
@@ -594,12 +624,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/pair/request", s.pairRequest)
 	mux.HandleFunc("GET /api/v1/pair/status", s.pairStatus)
 	mux.HandleFunc("POST /api/v1/pair/remove", s.pairTeardown)
-	mux.HandleFunc("GET /internal/monloader-pairing", s.monloaderPairingFragment)
-	mux.HandleFunc("POST /settings/monloader/pair/{id}/approve", s.monloaderPairApprove)
-	mux.HandleFunc("POST /settings/monloader/pair/{id}/deny", s.monloaderPairDeny)
-	mux.HandleFunc("POST /settings/monloader/pair/remove", s.monloaderPairRemove)
+	mux.HandleFunc("GET /internal/plugins/pairing", s.pluginPairingFragment)
+	mux.HandleFunc("POST /settings/plugins/pair/{id}/approve", s.pluginPairApprove)
+	mux.HandleFunc("POST /settings/plugins/pair/{id}/deny", s.pluginPairDeny)
+	mux.HandleFunc("POST /settings/plugins/{name}/remove", s.pluginPairRemove)
+	mux.HandleFunc("POST /settings/plugins/{name}/pause", s.pluginPause)
+	mux.HandleFunc("POST /settings/plugins/{name}/start", s.pluginStart)
+	mux.HandleFunc("POST /settings/plugins/{name}/stop", s.pluginStop)
+	mux.HandleFunc("POST /settings/plugins/theme", s.settingsThemePost)
 	mux.HandleFunc("POST /internal/monloader/disconnect", s.monloaderLightDisconnect)
 	mux.HandleFunc("POST /internal/monloader/reconnect", s.monloaderLightReconnect)
+	mux.HandleFunc("POST /internal/plugin/relay", s.pluginRelay)
+	// What a page needs: its own GETs (HEAD rides along) and its form posts.
+	mux.HandleFunc("GET "+pluginMountPrefix+"{name}/", s.pluginMount)
+	mux.HandleFunc("POST "+pluginMountPrefix+"{name}/", s.pluginMount)
 
 	api.New(s.cfg, &s.cfgMu, s.jobs, s.apiResolver, Version).Mount(mux)
 
@@ -721,16 +759,20 @@ type baseData struct {
 	DocURL      string
 	Variant     string
 	CustomCSS   bool
+	// Theme is true while an operator-installed theme resolves, gating the
+	// /theme.css link between the bundled sheet and the operator's own.
+	Theme bool
 	// BooruName is the operator's brand override (or "Monbooru" by
 	// default). Rendered into every page <title>, the topbar wordmark,
 	// and the login screen so a deployment that wants a different name
 	// only edits monbooru.toml.
 	BooruName string
 	// BooruLogo is the resolved URL for the topbar logo: "/custom.logo"
-	// when server.logo is set, the bundled logo.png otherwise.
-	// BooruFavicon is the same for the favicon <link>, falling back to
-	// the bundled favicon.png. A configured server.logo drives both, so
-	// they only diverge on their unset defaults.
+	// when server.logo is set, the active theme's "/theme.logo" when it
+	// ships one, the bundled logo.png otherwise.
+	// BooruFavicon is the same for the favicon <link>, minus the theme
+	// rung, falling back to the bundled favicon.png. A configured
+	// server.logo drives both; a theme only moves the topbar.
 	BooruLogo    string
 	BooruFavicon string
 	// MonloaderURL is the browser-facing monloader base for the footer
@@ -809,6 +851,7 @@ func (b baseData) AsMap() map[string]any {
 		"DocURL":              b.DocURL,
 		"Variant":             b.Variant,
 		"CustomCSS":           b.CustomCSS,
+		"Theme":               b.Theme,
 		"BooruName":           b.BooruName,
 		"BooruLogo":           b.BooruLogo,
 		"BooruFavicon":        b.BooruFavicon,
@@ -863,22 +906,20 @@ func (s *Server) base(r *http.Request, nav, title string) baseData {
 		conn, connVer, ptrReady, ptrSyncing, ptrContrib = "paused", "", false, false, false
 	}
 	paired := s.pairedWith("monloader")
-	// The monloader-backed actions only make sense when the link is actually
-	// up: hide them while paused or when a probe found monloader unreachable
-	// or rejecting. A cold cache ("") stays optimistic so a fresh boot does
-	// not blank the buttons before the first status poll lands.
-	monloaderUsable := paired && conn != "paused" && conn != "down" && conn != "rejected"
+	monloaderUsable := s.monloaderUsable()
+	themeSheet := s.activeTheme().Path != ""
 	return baseData{
 		Title:               title,
 		ActiveNav:           nav,
 		CSRFToken:           s.csrfToken(sessID),
-		AuthEnabled:         s.cfg.Auth.EnablePassword,
+		AuthEnabled:         s.authEnabled(),
 		Degraded:            degraded,
 		Version:             Version,
 		RepoURL:             RepoURL,
 		DocURL:              DocURL,
 		Variant:             Variant,
-		CustomCSS:           s.cfg.Server.CustomCSS != "",
+		CustomCSS:           s.customCSSPath() != "",
+		Theme:               themeSheet,
 		BooruName:           s.booruName(),
 		BooruLogo:           s.booruLogoURL(),
 		BooruFavicon:        s.booruFaviconURL(),
@@ -979,17 +1020,19 @@ func (s *Server) serveConfiguredFile(w http.ResponseWriter, r *http.Request, pat
 }
 
 func (s *Server) serveCustomCSS(w http.ResponseWriter, r *http.Request) {
-	s.serveConfiguredFile(w, r, s.cfg.Server.CustomCSS, "css")
+	s.serveConfiguredFile(w, r, s.customCSSPath(), "css")
 }
 
 func (s *Server) serveCustomLogo(w http.ResponseWriter, r *http.Request) {
-	s.serveConfiguredFile(w, r, s.cfg.Server.BooruLogo, "logo")
+	s.serveConfiguredFile(w, r, s.customLogoPath(), "logo")
 }
 
 // booruName resolves server.name with a "Monbooru" fallback so every
 // title-suffix callsite reads a single source of truth instead of
 // repeating the default.
 func (s *Server) booruName() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	if name := s.cfg.Server.BooruName; name != "" {
 		return name
 	}
@@ -1005,6 +1048,109 @@ func (s *Server) modelPath() string {
 	return s.cfg.Paths.ModelPath
 }
 
+// The settings handlers rewrite these fields at runtime under the write
+// lock, so every serving path reads them through one of the accessors
+// below. A string field is two words, and a torn read of one yields a
+// slice header that never existed - default_upload_folder feeds
+// gallery.ResolveSubdir, which creates directories from it.
+
+func (s *Server) authEnabled() bool {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Auth.EnablePassword
+}
+
+func (s *Server) passwordHash() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Auth.PasswordHash
+}
+
+func (s *Server) sessionLifetimeDays() int {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Auth.SessionLifetimeDays
+}
+
+func (s *Server) pageSize() int {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.UI.PageSize
+}
+
+func (s *Server) thumbnailFit() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.UI.ThumbnailFit
+}
+
+func (s *Server) maxFileSizeMB() int {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Gallery.MaxFileSizeMB
+}
+
+// watcherSettings pairs the two knobs every startWatcher call passes, so
+// a save landing between them cannot start a watcher on half of one.
+func (s *Server) watcherSettings() (bool, int) {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Gallery.WatchEnabled, s.cfg.Gallery.MaxFileSizeMB
+}
+
+func (s *Server) defaultUploadFolder() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Gallery.DefaultUploadFolder
+}
+
+func (s *Server) customCSSPath() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Server.CustomCSS
+}
+
+func (s *Server) customLogoPath() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Server.BooruLogo
+}
+
+func (s *Server) themeColor() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Server.ThemeColor
+}
+
+func (s *Server) defaultGallery() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.DefaultGallery
+}
+
+func (s *Server) derivePaths(name string) (string, string) {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.DerivePaths(name)
+}
+
+func (s *Server) executionProvider() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Tagger.ExecutionProvider
+}
+
+// cfgSnapshot copies the config for the tagger package, which takes the
+// whole struct and reads it for the length of a job. The copy is shallow:
+// its slices are the live headers, read under the lock, and the settings
+// writers replace those slices rather than growing them in place.
+func (s *Server) cfgSnapshot() *config.Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	c := *s.cfg
+	return &c
+}
+
 // galleries copies cfg.Galleries under the lock its mutators take. A
 // slice-header read torn against a reallocating append pairs the old
 // array pointer with the new length, so the copy walks off the end of
@@ -1017,18 +1163,40 @@ func (s *Server) galleries() []config.Gallery {
 	return out
 }
 
-// booruAsset points a branded surface at /custom.logo when
-// server.logo is configured. One override drives both the topbar logo
-// and the favicon; only the unset fallback differs.
-func (s *Server) booruAsset(fallback string) string {
-	if s.cfg.Server.BooruLogo != "" {
+// customLogoURL is the operator's server.logo override as a URL, empty
+// when the knob is unset. It outranks the active theme on every branded
+// surface: a config the operator wrote by hand beats one a theme folder
+// brought in.
+func (s *Server) customLogoURL() string {
+	if s.customLogoPath() != "" {
 		return "/custom.logo"
 	}
-	return fallback
+	return ""
 }
 
-func (s *Server) booruLogoURL() string    { return s.booruAsset("/static/logo.png") }
-func (s *Server) booruFaviconURL() string { return s.booruAsset("/static/favicon.png") }
+// booruLogoURL points the topbar logo at server.logo, else the active
+// theme's logo.png, else the bundled asset.
+func (s *Server) booruLogoURL() string {
+	if url := s.customLogoURL(); url != "" {
+		return url
+	}
+	if s.activeTheme().Logo != "" {
+		return "/theme.logo"
+	}
+	return "/static/logo.png"
+}
+
+// booruFaviconURL is the same for the favicon (and, through it, the
+// manifest icon), except that a theme does not reach it: a theme's
+// logo.png is drawn for the topbar, and at 16px in a tab it reduces to
+// mush. Only server.logo - which the operator picked knowing both
+// surfaces use it - replaces the bundled icon.
+func (s *Server) booruFaviconURL() string {
+	if url := s.customLogoURL(); url != "" {
+		return url
+	}
+	return "/static/favicon.png"
+}
 
 // monloaderWebBase is the browser-facing monloader base for the footer
 // "connected to monloader" link: the configured web url when set, else the api url.
@@ -1203,16 +1371,32 @@ func (s *Server) serveMangaPagePath(
 
 // serveImageFile serves the raw image/video file.
 func (s *Server) serveImageFile(w http.ResponseWriter, r *http.Request) {
+	s.serveImageBytes(w, r, false)
+}
+
+// serveImageView is what every viewer in the UI points at: the original
+// bytes, or - for a still past the display ceiling, which no browser will
+// decode - the bounded rendition instead. One endpoint rather than a
+// template branch so the lightbox and the relations surfaces, which build
+// their src in JS and hold no dimensions, get the same answer. The download
+// link and the <video> src stay on /file: those are the bytes themselves.
+func (s *Server) serveImageView(w http.ResponseWriter, r *http.Request) {
+	s.serveImageBytes(w, r, true)
+}
+
+func (s *Server) serveImageBytes(w http.ResponseWriter, r *http.Request, scaled bool) {
 	idStr := r.PathValue("id")
 	cx := s.Active()
 	if cx == nil {
 		http.NotFound(w, r)
 		return
 	}
+	var id int64
 	var canonPath, fileType string
+	var width, height sql.NullInt64
 	if err := cx.DB.Read.QueryRow(
-		`SELECT canonical_path, file_type FROM images WHERE id = ?`, idStr,
-	).Scan(&canonPath, &fileType); err != nil {
+		`SELECT id, canonical_path, file_type, width, height FROM images WHERE id = ?`, idStr,
+	).Scan(&id, &canonPath, &fileType, &width, &height); err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -1238,24 +1422,40 @@ func (s *Server) serveImageFile(w http.ResponseWriter, r *http.Request) {
 	// invalidates on a gallery switch even when mtimes happen to
 	// match. no-cache forces revalidation on every visit so the
 	// matching gallery still hits 304.
+	if scaled && !gallery.IsVideoType(fileType) && fileType != "cbz" &&
+		gallery.NeedsViewRendition(int(width.Int64), int(height.Int64)) {
+		rendition, err := gallery.EnsureViewRendition(canonPath, cx.ThumbnailsPath, id)
+		if err != nil {
+			logx.Warnf("view rendition for image %s: %v", idStr, err)
+		} else {
+			setGalleryScopedCache(w, s.activeName, idStr+"-view", rendition)
+			w.Header().Set("Content-Type", "image/jpeg")
+			http.ServeFile(w, r, rendition)
+			return
+		}
+	}
 	setGalleryScopedCache(w, s.activeName, idStr, canonPath)
 	if ct := gallery.MIMEForFileType(fileType); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
+	w.Header().Set("Content-Disposition", gallery.ContentDispositionFor(canonPath))
 	http.ServeFile(w, r, canonPath)
 }
 
 // setGalleryScopedCache writes an ETag that includes the gallery name
 // so a browser's cached copy from a different gallery's id=N is
 // invalidated on the next conditional request. Falls back silently if
-// the file can't be stat'd.
+// the file can't be stat'd. The mtime is nanoseconds: a plugin turning
+// an image twice inside one second writes two different files, and at
+// whole-second resolution the second one rides the first one's tag and
+// the browser keeps painting the bytes it already has.
 func setGalleryScopedCache(w http.ResponseWriter, gallery, id, path string) {
 	w.Header().Set("Cache-Control", "private, no-cache")
 	info, err := os.Stat(path)
 	if err != nil {
 		return
 	}
-	w.Header().Set("ETag", fmt.Sprintf(`"%s-%s-%d"`, gallery, id, info.ModTime().Unix()))
+	w.Header().Set("ETag", fmt.Sprintf(`"%s-%s-%d"`, gallery, id, info.ModTime().UnixNano()))
 }
 
 // Close stops background goroutines and closes every gallery's database.
@@ -1266,6 +1466,7 @@ func (s *Server) Close() {
 	default:
 		close(s.done)
 	}
+	s.stopAllManaged()
 	tagger.ReleaseAll()
 	s.ctxMu.Lock()
 	defer s.ctxMu.Unlock()

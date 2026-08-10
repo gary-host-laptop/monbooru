@@ -274,9 +274,9 @@ func (m *Manager) scheduleAutoDismiss() {
 	m.armDismiss(dismissDelay)
 }
 
-// armDismiss replaces any pending dismiss with one d from now. It fires
-// only while the state is still the completed one it was armed against:
-// a job started in the meantime owns the widget. Caller must hold m.mu.
+// armDismiss replaces any pending dismiss with one d from now. It clears
+// only a completed state: a job running by the time it fires owns the
+// widget and keeps it. Caller must hold m.mu.
 func (m *Manager) armDismiss(d time.Duration) {
 	if m.timer != nil {
 		m.timer.Stop()

@@ -94,7 +94,7 @@
         </form>
         {{if and (not (or (eq .Image.FileType "mp4") (eq .Image.FileType "webm"))) (not .IsManga) (not .Image.IsMissing)}}
         <button type="button" class="btn-sm btn-view" title="View image (v)"
-                onclick="openLightbox(null, '/images/{{.Image.ID}}/file')">⛶</button>
+                onclick="openLightbox(null, '/images/{{.Image.ID}}/view')">⛶</button>
         {{end}}
         <a href="/images/{{.Image.ID}}/file" download class="btn-sm" title="Download image">⤓</a>
       </div>
@@ -151,6 +151,51 @@
       </div>
     </form>
   </dialog>
+
+  {{if .IsManga}}
+  <dialog id="generate-collection-dialog">
+    <form id="generate-collection-form">
+      <p>Generate a collection from <strong>{{.Filename}}</strong>?</p>
+      <p class="field-hint">Every page is extracted as its own image and grouped under this collection. The archive itself is left untouched.</p>
+      <div class="field">
+        <label>Collection name</label>
+        {{template "suggest_input" dict "Name" "collection" "InputID" "generate-collection-input" "Endpoint" "/internal/collection/suggest" "SuggestID" "generate-collection-suggest"}}
+      </div>
+      <div id="generate-collection-error"></div>
+      <div class="dialog-actions">
+        <button type="submit">Generate</button>
+        <button type="button" onclick="document.getElementById('generate-collection-dialog').close()">Cancel</button>
+      </div>
+    </form>
+    <script>
+    function openGenerateCollectionDialog(btn) {
+      var input = document.getElementById('generate-collection-input');
+      input.value = btn.dataset.hint || '';
+      clearSlots('generate-collection-suggest', 'generate-collection-error');
+      document.getElementById('generate-collection-dialog').showModal();
+      input.focus();
+      input.select();
+    }
+    document.getElementById('generate-collection-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var name = document.getElementById('generate-collection-input').value.trim();
+      var err = document.getElementById('generate-collection-error');
+      err.innerHTML = '';
+      if (!name) { err.innerHTML = '<div class="flash flash-err">Collection name required.</div>'; return; }
+      postForm('/images/{{.Image.ID}}/generate-collection', {collection: name}, {
+        okStatus: 202,
+        dialogId: 'generate-collection-dialog',
+        flashId: 'generate-collection-error',
+        failMsg: 'Generation failed.',
+        catchMsg: 'Generation request failed.',
+        onOK: function() {
+          if (typeof refreshJobStatus === 'function') refreshJobStatus();
+        }
+      });
+    });
+    </script>
+  </dialog>
+  {{end}}
 
   <dialog id="commentary-dialog">
     <form id="commentary-form" hx-post="/images/{{.Image.ID}}/commentary/set"
@@ -471,8 +516,8 @@
         </a>
         {{else}}
         <div class="detail-media-frame">
-          <a href="/images/{{.Image.ID}}/file" target="_blank"{{if not .Image.IsMissing}} class="detail-img-link" onclick="return openLightbox(event, this.href)"{{end}}>
-            <img src="/images/{{.Image.ID}}/file" alt="image {{.Image.ID}}" class="detail-img"
+          <a href="/images/{{.Image.ID}}/view" target="_blank"{{if not .Image.IsMissing}} class="detail-img-link" onclick="return openLightbox(event, this.href)"{{end}}>
+            <img src="/images/{{.Image.ID}}/view" alt="image {{.Image.ID}}" class="detail-img"
                  onerror="if(!this.dataset.fallback){this.dataset.fallback='1';this.src='/thumbnails/{{.ActiveGallery}}/{{.Image.ID}}.jpg';}else{this.onerror=null;}">
           </a>
           {{if .Annotations}}
@@ -483,6 +528,9 @@
           </div>
           {{end}}
         </div>
+        {{if .PreviewScaled}}
+        <div class="detail-preview-note"><span class="field-hint">Showing a {{.PreviewMaxDim}} px preview; the full-size file is too large for a browser to display.</span></div>
+        {{end}}
         {{if .Annotations}}
         <div class="annotation-controls"><button type="button" class="btn-link-accent annotation-toggle" onclick="toggleAnnotations(this)">[hide annotations]</button></div>
         {{end}}
@@ -495,6 +543,9 @@
         {{if .Image.PageCount}}{{if gt (deref .Image.PageCount) 1}}
         <a href="/images/{{.Image.ID}}/pages{{.BackQS}}" class="btn-manga-action btn-pages" title="See all pages (P)">See all pages <span class="btn-key-hint">(P)</span></a>
         {{end}}{{end}}
+        {{if not .Image.IsMissing}}
+        <button type="button" class="btn-manga-action btn-generate-collection" data-hint="{{.MangaHint}}" onclick="openGenerateCollectionDialog(this)" title="Extract every page as its own image in a new collection">Generate collection</button>
+        {{end}}
       </div>
       {{end}}
 
@@ -530,8 +581,7 @@
 
       {{/* Tag editor */}}
       <div class="tag-editor-section">
-        <h3>Tags</h3>
-        {{template "partials/tag_list.html" (dict "ImageID" .Image.ID "ImageTags" .ImageTags "TagSources" .TagSources "Aliases" .Aliases "CSRFToken" .CSRFToken)}}
+        {{template "partials/tag_list.html" (dict "ImageID" .Image.ID "CSRFToken" .CSRFToken)}}
         <form id="add-tag-form" class="add-tag-form"
               hx-post="/images/{{.Image.ID}}/tags"
               hx-target="#image-tags"
@@ -562,6 +612,15 @@
                   data-confirm-ok="Lookup online boorus">Lookup online boorus</button>
           {{end}}
         </form>
+        {{if and .MonloaderUsable .Lookup.Tried}}
+        {{/* The pill above covers the first few minutes of an attempt and
+             then abandons it at its poll cap; this reads from the recorded
+             row, so an image never looks like nothing ever happened. */}}
+        <div class="field-hint lookup-history">
+          {{if not .Lookup.QueuedAt.IsZero}}Lookup queued {{localTime .Lookup.QueuedAt}}, waiting on monloader.
+          {{else}}Last looked up {{localDate .Lookup.LastAt}}, {{lookupResultLabel .Lookup.LastResult}}.{{end}}
+        </div>
+        {{end}}
         {{if .MonloaderPaired}}<div id="fetch-pending" class="fetch-status"></div>{{end}}
       </div>
 
@@ -570,6 +629,16 @@
       {{/* The dialog mounts here, outside the panel, so a panel refetch never
            destroys an open dialog with its ticks and typed reasons. */}}
       <div id="ptr-contrib-dialog-host"></div>
+      {{end}}
+
+      {{/* Third-party buttons get their own block rather than trailing the
+           built-ins, and it renders here rather than inside the danger-zone
+           partial because that one is OOB-replaced on every tag mutation. */}}
+      {{if .PluginSlot.Any}}
+      <div class="plugin-card" data-image-id="{{.Image.ID}}">
+        <div class="plugin-card-title">Plugins</div>
+        {{template "partials/plugin_buttons.html" .PluginSlot}}
+      </div>
       {{end}}
 
       {{/* Danger zone: delete + a remove-tags dialog. Rendered via a partial so
@@ -877,8 +946,12 @@
                 </li>
                 {{end}}
               </ul>
-              {{else}}<span class="field-hint">(none)</span>{{end}}
-              <button type="button" class="btn-link-accent btn-add-source" title="Add a source">[+ add]</button>
+              {{end}}
+              <div class="source-add-row">
+                {{if not .Sources}}<span class="field-hint">(none)</span>{{end}}
+                <button type="button" class="btn-link-accent btn-add-source" title="Add a source">[+ add]</button>
+                {{if and .MonloaderUsable .Lookup.ScheduleOn}}{{template "partials/scheduled_lookup.html" (dict "Lookup" .Lookup "CSRFToken" .CSRFToken)}}{{end}}
+              </div>
             </td></tr>
             <tr><th>Collections</th><td>
               {{if .Collections}}

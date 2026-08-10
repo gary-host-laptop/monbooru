@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -92,12 +93,17 @@ func parseScheduleTime(v string) (schedTime, error) {
 }
 
 func schedHasAnyEnabled(sc config.ScheduleConfig) bool {
-	return sc.SyncGallery || sc.RemoveOrphans || sc.RunAutoTaggers || sc.FindRelationPairs
+	return sc.SyncGallery || sc.RemoveOrphans || sc.RunAutoTaggers || sc.FindRelationPairs ||
+		sc.LookupPTR || sc.LookupBooru
 }
 
 // runScheduledActions iterates every configured gallery and runs the enabled
 // maintenance actions in a fixed order: sync → remove orphans → autotag →
-// find-pairs.
+// find-pairs → PTR lookup → online lookup.
+// The lookup phases come last because they are the ones an external limit can
+// cut short, and cutting them short must not cost the rest of the run. After
+// autotag deliberately: the tag write and the lookup write on the same row
+// are better not interleaved.
 // Skips the whole run when a user-triggered job is already holding the
 // job manager. The reservation blocks user-triggered Start() calls for
 // the duration so the lock-less phases (RemoveOrphans) can't be raced
@@ -110,6 +116,7 @@ func (s *Server) runScheduledActions() {
 	defer s.jobs.EndSchedule()
 
 	started := time.Now()
+	s.clearLookupRun()
 	var failures []string
 	cancelled := false
 	defer func() {
@@ -133,6 +140,12 @@ func (s *Server) runScheduledActions() {
 		names = append(names, name)
 	}
 	s.ctxMu.RUnlock()
+	// Sorted, then rotated to the gallery after the one the last run stopped
+	// at. A daily budget too small to cover gallery 1 would otherwise starve
+	// every other gallery permanently, and map order gives no rotation to
+	// build on. Losing the offset on a restart costs one unfair run.
+	slices.Sort(names)
+	names = rotateStrings(names, s.nextScheduleOffset(len(names)))
 
 	// User cancel mid-run clears scheduleHeld (Manager.Cancel does this)
 	// so the outer loop can bail at the next phase boundary. Without
@@ -175,7 +188,7 @@ func (s *Server) runScheduledActions() {
 				return
 			}
 		}
-		if sched.RunAutoTaggers && tagger.IsAvailable(s.cfg) {
+		if sched.RunAutoTaggers && tagger.IsAvailable(s.cfgSnapshot()) {
 			if err := s.scheduledAutotag(cx); err != nil {
 				failures = append(failures, "autotag "+name+": "+err.Error())
 			}
@@ -187,8 +200,66 @@ func (s *Server) runScheduledActions() {
 			if err := s.scheduledFindRelationPairs(cx); err != nil {
 				failures = append(failures, "find-pairs "+name+": "+err.Error())
 			}
+			if abort() {
+				return
+			}
+		}
+		// A saved checkbox survives monloader going away: the phase is
+		// skipped with a line in the summary, never silently unset.
+		if sched.LookupPTR {
+			switch {
+			case !s.monloaderUsable():
+				s.recordLookupRun("[" + name + "] Lookup skipped: monloader unreachable.")
+			case !s.monloaderPTRReady():
+				s.recordLookupRun("[" + name + "] PTR lookup skipped: monloader's index is not ready.")
+			default:
+				if err := s.scheduledPTRLookup(cx); err != nil {
+					failures = append(failures, "ptr-lookup "+name+": "+err.Error())
+				}
+			}
+			if abort() {
+				return
+			}
+		}
+		if sched.LookupBooru {
+			if !s.monloaderUsable() {
+				s.recordLookupRun("[" + name + "] Online lookup skipped: monloader unreachable.")
+			} else if err := s.scheduledOnlineLookup(cx); err != nil {
+				failures = append(failures, "online-lookup "+name+": "+err.Error())
+			}
+			if abort() {
+				return
+			}
 		}
 	}
+}
+
+// monloaderPTRReady reports the cached PTR capability, so a phase can skip a
+// backend monloader would only 409 anyway.
+func (s *Server) monloaderPTRReady() bool {
+	_, _, ready, _, _ := s.monloaderStatusSeed()
+	return ready
+}
+
+// nextScheduleOffset returns where this run starts in the gallery list and
+// advances the stored position for the next one.
+func (s *Server) nextScheduleOffset(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	start := s.schedGalleryOffset % n
+	s.schedGalleryOffset = (start + 1) % n
+	return start
+}
+
+// rotateStrings returns names starting at offset and wrapping around.
+func rotateStrings(names []string, offset int) []string {
+	if offset <= 0 || offset >= len(names) {
+		return names
+	}
+	return append(append([]string(nil), names[offset:]...), names[:offset]...)
 }
 
 func (s *Server) scheduledFindRelationPairs(cx *galleryCtx) error {
@@ -227,7 +298,7 @@ func (s *Server) scheduledSync(cx *galleryCtx) error {
 		return err
 	}
 	ctx := s.jobs.Context()
-	result, err := cx.Sync(ctx, s.cfg.Gallery.MaxFileSizeMB, s.jobs.Update)
+	result, err := cx.Sync(ctx, s.maxFileSizeMB(), s.jobs.Update)
 	// Match the user-trigger handlers' shape: ctx cancellation produces
 	// a clean Complete summary, only real failures fall to Fail().
 	if ctx.Err() != nil {
@@ -308,6 +379,8 @@ func (s *Server) runOrphanSweep(ctx context.Context, cx *galleryCtx) (removed, p
 		switch {
 		case strings.HasSuffix(name, "_hover.webp"):
 			idStr = strings.TrimSuffix(name, "_hover.webp")
+		case strings.HasSuffix(name, "_view.jpg"):
+			idStr = strings.TrimSuffix(name, "_view.jpg")
 		case strings.HasSuffix(name, ".jpg"):
 			idStr = strings.TrimSuffix(name, ".jpg")
 		default:
@@ -343,7 +416,8 @@ func (s *Server) scheduledAutotag(cx *galleryCtx) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	enabled := tagger.EnabledTaggersForGallery(s.cfg, cx.Name)
+	cfg := s.cfgSnapshot()
+	enabled := tagger.EnabledTaggersForGallery(cfg, cx.Name)
 	if len(enabled) == 0 {
 		return nil
 	}
@@ -353,7 +427,7 @@ func (s *Server) scheduledAutotag(cx *galleryCtx) error {
 	}
 	ctx := s.jobs.Context()
 	baseline := readVmRSS()
-	skipped, err := tagger.RunWithTaggers(ctx, cx.DB, s.cfg, ids, enabled, s.jobs, s.cfg.Tagger.ExecutionProvider, cx.MangaCacheDir())
+	skipped, err := tagger.RunWithTaggers(ctx, cx.DB, cfg, ids, enabled, s.jobs, cfg.Tagger.ExecutionProvider, cx.MangaCacheDir())
 	err = s.completeAutotagRun(cx, ctx, "["+cx.Name+"] ", "",
 		"scheduled "+cx.Name, len(ids), skipped, baseline, err)
 	if err != nil {
@@ -373,6 +447,23 @@ func (s *Server) recordScheduleRun(started time.Time, dur time.Duration, info st
 	s.schedLastInfo = info
 }
 
+// recordLookupRun keeps a lookup phase's summary for the Schedule section's
+// own status line, which the run-level "OK" cannot carry: the operator wants
+// to know what the night found, not only that it finished. Lines accumulate
+// across the run's phases and galleries; clearLookupRun starts the next run
+// from empty.
+func (s *Server) recordLookupRun(summary string) {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	s.schedLookupInfo = append(s.schedLookupInfo, summary)
+}
+
+func (s *Server) clearLookupRun() {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	s.schedLookupInfo = nil
+}
+
 // ScheduleStatus reports the last recorded scheduler run plus the next fire
 // time. Used by the Schedule settings section.
 type ScheduleStatus struct {
@@ -380,12 +471,18 @@ type ScheduleStatus struct {
 	LastDur  time.Duration // zero when LastRun is zero
 	LastInfo string        // "OK" or a short failure summary; empty when never run
 	NextRun  time.Time     // zero when no schedule action is enabled
+	// LookupInfo is what the last run's lookup phases found, one line per
+	// phase and gallery; empty when neither phase ran.
+	LookupInfo []string
 }
 
 // ScheduleStatus returns the current scheduler status for the settings page.
 func (s *Server) ScheduleStatus() ScheduleStatus {
 	s.schedMu.Lock()
-	st := ScheduleStatus{LastRun: s.schedLastRun, LastDur: s.schedLastDur, LastInfo: s.schedLastInfo}
+	st := ScheduleStatus{
+		LastRun: s.schedLastRun, LastDur: s.schedLastDur, LastInfo: s.schedLastInfo,
+		LookupInfo: append([]string(nil), s.schedLookupInfo...),
+	}
 	s.schedMu.Unlock()
 	if next, ok := s.nextScheduledFire(time.Now()); ok {
 		st.NextRun = next

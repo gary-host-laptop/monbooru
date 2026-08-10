@@ -211,6 +211,36 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, or
 
 	folderPath := FolderPath(galleryPath, path)
 
+	// The path is already registered under a different SHA: the file was
+	// rewritten where it stands (a crop in an external editor, a watcher
+	// WRITE on a known file). image_paths.path is UNIQUE, so the insert
+	// below would die on the constraint and roll the whole ingest back,
+	// leaving the row describing bytes that are gone.
+	var prevID int64
+	var prevCanonical int
+	switch pathErr := database.Read.QueryRow(
+		`SELECT image_id, is_canonical FROM image_paths WHERE path = ?`, path,
+	).Scan(&prevID, &prevCanonical); {
+	case pathErr == nil && prevCanonical == 1:
+		if editErr := applyInPlaceEdit(database, thumbnailsPath, path, hash,
+			fi.ModTime().Unix(), fi.ModTime().UnixNano(), fi.Size()); editErr != nil {
+			return nil, false, editErr
+		}
+		return &models.Image{
+			ID: prevID, SHA256: hash, CanonicalPath: path, FolderPath: folderPath,
+			FileType: fileType, FileSize: fi.Size(),
+		}, false, nil
+	case pathErr == nil:
+		// An alias path whose bytes no longer match the image it was a copy
+		// of. The row it pointed at still has its own file; this one is a
+		// new image and needs the path.
+		if _, delErr := database.Write.Exec(`DELETE FROM image_paths WHERE path = ?`, path); delErr != nil {
+			return nil, false, fmt.Errorf("dropping stale alias path: %w", delErr)
+		}
+	case pathErr != sql.ErrNoRows:
+		return nil, false, fmt.Errorf("checking image_paths: %w", pathErr)
+	}
+
 	var imgWidth, imgHeight *int
 	var pageCount *int
 	var durationSec *float64
@@ -308,8 +338,8 @@ func ingestWithHash(database *db.DB, galleryPath, thumbnailsPath, path, hash, or
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO image_paths (image_id, path, is_canonical, mtime_unix) VALUES (?, ?, 1, ?)`,
-		imgID, path, fi.ModTime().Unix(),
+		`INSERT INTO image_paths (image_id, path, is_canonical, mtime_unix, mtime_nsec) VALUES (?, ?, 1, ?, ?)`,
+		imgID, path, fi.ModTime().Unix(), fi.ModTime().UnixNano(),
 	); err != nil {
 		return nil, false, fmt.Errorf("inserting image_path: %w", err)
 	}

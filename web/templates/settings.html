@@ -4,7 +4,7 @@
      bespoke for the inline view link in its hint. */}}
 {{define "maintenance_row"}}
         <tr>
-          <td><strong>{{.Title}}</strong> <span class="field-hint">- {{.Desc}}</span></td>
+          <td><strong{{if .Accent}} class="{{.Accent}}"{{end}}>{{.Title}}</strong> <span class="field-hint">- {{.Desc}}</span></td>
           <td>
             <form hx-post="{{.URL}}" hx-target="#flash-maintenance" hx-swap="innerHTML"
                   {{if .JobKick}}hx-on::after-request="if(event.detail.successful){document.getElementById('job-status').setAttribute('hx-trigger','load');htmx.trigger('#job-status','load')}"
@@ -14,7 +14,7 @@
                   {{end}}style="display:inline">
               <input type="hidden" name="_csrf" value="{{.CSRF}}">
               {{range $k, $v := .Fields}}<input type="hidden" name="{{$k}}" value="{{$v}}">
-              {{end}}<button type="submit" class="{{if .Danger}}btn-danger {{end}}btn-sm">{{.Verb}}</button>
+              {{end}}<button type="submit" class="{{if .Danger}}btn-danger {{end}}btn-sm{{if .Accent}} {{.Accent}}{{end}}">{{.Verb}}</button>
             </form>
           </td>
         </tr>
@@ -25,7 +25,7 @@
   <nav class="settings-nav">
     <a href="#general">General</a>
     <a href="#galleries">Galleries</a>
-    <a href="#monloader">Monloader</a>
+    <a href="#plugins">Plugins</a>
     <a href="#tagger">Tagger</a>
     <a href="#relations">Relations</a>
     <a href="#auth">Auth</a>
@@ -40,9 +40,9 @@
 {{$cfg  := index . "Config"}}
 {{$galleries := index . "Galleries"}}
 {{$active := index . "ActiveGallery"}}
-{{$monloaderPending := index . "MonloaderPending"}}
-{{$monloaderPaired := index . "MonloaderPaired"}}
-{{$monloaderPeerURL := index . "MonloaderPeerURL"}}
+{{$pluginPending := index . "PluginPending"}}
+{{$pluginPaired := index . "PluginPaired"}}
+{{$pluginRows := index . "PluginRows"}}
 
 <div id="settings-page">
   <h2>Settings</h2>
@@ -122,7 +122,7 @@
             {{if ne .Name $cfg.DefaultGallery}}
             <form hx-post="/settings/galleries/{{.Name}}/default" hx-target="#flash-galleries" hx-swap="innerHTML" style="display:inline">
               <input type="hidden" name="_csrf" value="{{$csrf}}">
-              <button type="submit" class="btn-sm btn-set-default">Set default</button>
+              <button type="submit" class="btn-sm btn-success">Set default</button>
             </form>
             {{else}}
             <span class="status-dim">-</span>
@@ -467,31 +467,28 @@
   }
   </script>
 
-  <section id="monloader" class="settings-section">
-    <h3>Monloader</h3>
-    <div id="flash-monloader"></div>
-    <form hx-post="/settings/monloader" hx-target="#flash-monloader" hx-swap="innerHTML">
-      <input type="hidden" name="_csrf" value="{{$csrf}}">
-      <div class="settings-sub">
-        <h4>URLs</h4>
-        <div class="settings-cols">
-          <div class="field">
-            <label for="monloader_api_url">api url</label>
-            <input type="text" name="api_url" id="monloader_api_url" value="{{$cfg.Monloader.APIURL}}" placeholder="auto-detected from pairing">
-            <p class="field-hint">Internal URL monbooru uses to reach monloader. Blank = auto-detected from the pairing.</p>
-          </div>
-          <div class="field">
-            <label for="monloader_url">web url</label>
-            <input type="text" name="monloader_url" id="monloader_url" value="{{$cfg.Server.MonloaderURL}}" placeholder="http://localhost:8081">
-            <p class="field-hint">Browser URL for the footer "connected to monloader" link; blank = same as api url.</p>
-          </div>
-        </div>
-      </div>
-      <div class="settings-actions"><button type="submit">Save</button></div>
-    </form>
+  <section id="plugins" class="settings-section">
+    <h3>Plugins</h3>
+    <div id="flash-plugins"></div>
     <div class="settings-sub">
-      <h4>Pairing</h4>
-      {{template "partials/monloader_pairing.html" (dict "Pending" $monloaderPending "Paired" $monloaderPaired "PeerURL" $monloaderPeerURL "CSRFToken" $csrf)}}
+      <h4>Pairing requests</h4>
+      {{template "partials/plugin_pairing.html" (dict "Pending" $pluginPending "Paired" $pluginPaired "CSRFToken" $csrf)}}
+    </div>
+    <div class="settings-sub">
+      <div class="settings-sub-head">
+        <h4>Installed</h4>
+        <p class="field-hint">Put a plugin folder in <code>{{index . "PluginsDir"}}</code>.</p>
+      </div>
+      {{template "partials/plugin_rows.html" (dict "Rows" $pluginRows "CSRFToken" $csrf)}}
+    </div>
+
+    {{$themes := index . "Themes"}}
+    <div class="settings-sub">
+      <div class="settings-sub-head">
+        <h4>Themes</h4>
+        <p class="field-hint">Put a theme folder in <code>{{index . "ThemesDir"}}</code>.</p>
+      </div>
+      {{template "partials/theme_cluster.html" (dict "Names" $themes.Names "Active" $themes.Active "CSRFToken" $csrf)}}
     </div>
   </section>
 
@@ -720,6 +717,9 @@
           </td>
         </tr>
         {{template "maintenance_row" dict "CSRF" $csrf "Title" "Find folded duplicates" "Desc" "pair pre-widening folded tags with their corrected spelling, then review and merge on the Tags page (Folded dup. filter)" "URL" "/settings/maintenance/find-folded-duplicates" "Verb" "Scan" "JobKick" true}}
+        {{if .MonloaderUsable}}
+        {{template "maintenance_row" dict "CSRF" $csrf "Title" "Look up unsourced images" "Accent" "monloader-accent" "Desc" "run the scheduled lookup now on the images that are due" "URL" "/settings/maintenance/lookup-due" "Verb" "Look up" "JobKick" true "Confirm" "Look up the images that are due now?" "ConfirmDanger" "Online lookups count against monloader's daily budget." "ConfirmOK" "Look up"}}
+        {{end}}
         {{template "maintenance_row" dict "CSRF" $csrf "Title" "Re-extract metadata" "Desc" "re-parse metadata for every image" "URL" "/settings/maintenance/re-extract-metadata" "Verb" "Re-extract" "Confirm" "Re-parse metadata for every image in this gallery?" "ConfirmDanger" "Long-running job; blocks other jobs until it finishes." "ConfirmOK" "Re-extract"}}
         {{template "maintenance_row" dict "CSRF" $csrf "Title" "Vacuum database" "Desc" "compact the SQLite file after mass deletions" "URL" "/settings/maintenance/vacuum-db" "Verb" "Vacuum" "Confirm" "Compact the SQLite database now?" "ConfirmDanger" "Holds a database lock for the duration of the VACUUM; other jobs and queries will wait." "ConfirmOK" "Vacuum"}}
         {{template "maintenance_row" dict "CSRF" $csrf "Title" "Free memory" "Desc" "shrink SQLite caches, return the Go heap, and release the auto-tagger from RAM/VRAM." "URL" "/settings/maintenance/free-memory" "Verb" "Free"}}
@@ -739,6 +739,11 @@
       {{if $schedSt.LastRun.IsZero}}Last run: never.{{else}}Last run: {{$schedSt.LastRun.Format "2006-01-02 15:04:05"}} ({{$schedSt.LastInfo}}, {{schedDuration $schedSt.LastDur}}).{{end}}
       {{if $schedSt.NextRun.IsZero}}No next run scheduled (every action is off).{{else}}Next run: {{$schedSt.NextRun.Format "2006-01-02 15:04:05"}}.{{end}}
     </p>
+    {{if $schedSt.LookupInfo}}
+    <p class="field-hint">
+      {{range $schedSt.LookupInfo}}{{.}} {{end}}<a href="/?q=lookup:due">[see them]</a>
+    </p>
+    {{end}}
     <form hx-post="/settings/schedule" hx-target="#flash-schedule" hx-swap="innerHTML">
       <input type="hidden" name="_csrf" value="{{$csrf}}">
       <div class="field">
@@ -754,11 +759,19 @@
           <label><input type="checkbox" name="remove_orphans"{{if $sched.RemoveOrphans}} checked{{end}}> Remove orphaned thumbnails</label>
         </div>
         <div class="field">
-          <label><input type="checkbox" name="run_auto_taggers"{{if $sched.RunAutoTaggers}} checked{{end}}> Run enabled auto-taggers</label>
+          <label class="tagger-accent"><input type="checkbox" name="run_auto_taggers"{{if $sched.RunAutoTaggers}} checked{{end}}> Run enabled auto-taggers</label>
         </div>
         <div class="field">
           <label><input type="checkbox" name="find_relation_pairs"{{if $sched.FindRelationPairs}} checked{{end}}> Find relation pairs</label>
         </div>
+        {{if .MonloaderUsable}}
+        <div class="field">
+          <label class="monloader-accent"{{if .MonloaderPTRSyncing}} title="monloader's PTR index is still syncing"{{else if not .MonloaderPTR}} title="the PTR index is off on monloader"{{end}}><input type="checkbox" name="lookup_ptr"{{if $sched.LookupPTR}} checked{{end}}{{if not .MonloaderPTR}} disabled{{end}}> Look up unsourced images in the Public Tag Repository</label>
+        </div>
+        <div class="field">
+          <label class="monloader-accent"><input type="checkbox" name="lookup_booru"{{if $sched.LookupBooru}} checked{{end}}> Look up unsourced images on online boorus</label>
+        </div>
+        {{end}}
       </div>
       <div class="settings-actions"><button type="submit">Save</button></div>
     </form>

@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
@@ -797,32 +799,91 @@ func (s *Server) runBatchCollection(ids []int64, label, mode string) {
 	s.jobs.Complete(fmt.Sprintf("Added %d image(s) to collection.", processed))
 }
 
-// batchLookup fans a monloader tag lookup across `scope=search` or
-// `scope=selection`. mode=source re-fetches every declared source of each
-// image; mode=all enqueues a hash lookup per image (md5 hashed on demand plus
-// the stored sha256, monloader runs whichever backends it has enabled);
-// mode=ptr and mode=booru target one backend, so a large scope can stay on the
-// free local index or spare it. The action is hidden unless monloader is
-// paired.
+// batchLookup fans one of three unrelated operations across `scope=search`
+// or `scope=selection`: mode=refresh re-fetches every declared source,
+// mode=hash discovers new ones by file hash (ptr / booru pick the backends,
+// unsourced narrows the scope to the images that could gain a source), and
+// mode=schedule sets the per-image opt-in the nightly run reads. The action
+// is hidden unless monloader is paired.
 func (s *Server) batchLookup(w http.ResponseWriter, r *http.Request) {
 	if !parseFormOK(w, r) {
 		return
 	}
-	mode := r.FormValue("mode")
-	if mode != "source" && mode != "all" && mode != "ptr" && mode != "booru" {
+	opts := batchLookupOpts{
+		mode:      r.FormValue("mode"),
+		ptr:       r.FormValue("ptr") == "1",
+		booru:     r.FormValue("booru") == "1",
+		unsourced: r.FormValue("unsourced") == "1",
+		on:        r.FormValue("on") == "1",
+	}
+	switch opts.mode {
+	case "refresh", "schedule":
+	case "hash":
+		if !opts.ptr && !opts.booru {
+			http.Error(w, "pick at least one lookup backend", http.StatusBadRequest)
+			return
+		}
+	default:
 		http.Error(w, "unknown lookup mode", http.StatusBadRequest)
 		return
 	}
 	s.startScopedJob(w, r, "batch-lookup", models.JobTypeTag, func(ids []int64) {
-		s.runBatchLookup(mode, ids)
+		s.runBatchLookup(opts, ids)
 	})
 }
 
-// runBatchLookup enqueues one monloader job per image, stopping early if
-// monloader becomes unreachable (each enqueue is a bounded LAN call, so this
-// stays a foreground-light background job). Images without the needed key -
-// a source url, a readable file to md5 - are skipped and counted.
-func (s *Server) runBatchLookup(mode string, ids []int64) {
+// batchLookupOpts is one dialog submission.
+type batchLookupOpts struct {
+	mode       string
+	ptr, booru bool
+	unsourced  bool
+	on         bool
+}
+
+// batchLookupCount answers the dialog's scope split so its live summary can
+// price each operation. The refresh branch is only worth firing for the
+// images that already carry a source, and the hash branch only for the ones
+// that do not; without the split the dialog would have to guess.
+func (s *Server) batchLookupCount(w http.ResponseWriter, r *http.Request) {
+	if !parseFormOK(w, r) {
+		return
+	}
+	ids, ok := s.resolveBatchScope(w, r, "batch-lookup-count")
+	if !ok {
+		return
+	}
+	// The dialog opens on the whole visible library often enough that a
+	// chunked EXISTS probe means thousands of round trips before the
+	// operator has committed to anything. Read the sourced ids once
+	// instead - the set is bounded by how many images carry a source,
+	// not by the scope - and intersect in memory.
+	withURL, err := db.QueryIDs(s.db().Read,
+		`SELECT DISTINCT image_id FROM image_sources WHERE url <> ''`)
+	if err != nil {
+		flashStatus(w, http.StatusInternalServerError, "Count failed.")
+		return
+	}
+	slices.Sort(withURL)
+	sourced := 0
+	for _, id := range ids {
+		if _, found := slices.BinarySearch(withURL, id); found {
+			sourced++
+		}
+	}
+	writePairJSON(w, http.StatusOK, map[string]int{"total": len(ids), "sourced": sourced, "unsourced": len(ids) - sourced})
+}
+
+// runBatchLookup applies one dialog submission across the scope, stopping
+// early if monloader becomes unreachable (each enqueue is a bounded LAN call,
+// so this stays a foreground-light background job). Images without the needed
+// key - a source url, a readable file to md5 - are skipped and counted.
+//
+// A hash lookup here takes the background lane but is never budgeted: bulk
+// work whoever started it, so it belongs behind anything a person is waiting
+// on, but it is also a deliberate operator action, so the nightly budget must
+// not refuse it. The PTR half rides the batch endpoint like the scheduled
+// phase and enqueues nothing at all.
+func (s *Server) runBatchLookup(opts batchLookupOpts, ids []int64) {
 	ctx := s.jobs.Context()
 	// Snapshot the gallery once so every row read and enqueue in this job
 	// stays consistent even if a switch is attempted concurrently.
@@ -831,78 +892,203 @@ func (s *Server) runBatchLookup(mode string, ids []int64) {
 		s.jobs.Fail("no active gallery")
 		return
 	}
-	galleryName := cx.Name
-	enqueued, skipped := 0, 0
+	if opts.mode == "schedule" {
+		s.runBatchSchedule(ctx, cx, opts.on, ids)
+		return
+	}
+	if opts.mode == "hash" && opts.unsourced {
+		ids = s.unsourcedOnly(cx, ids)
+	}
+
+	enqueued, skipped, matched := 0, 0, 0
+	ptrRefused := false
 	total := len(ids)
 	s.jobs.Update(0, total, "looking up…")
-	for i, id := range ids {
-		if ctx.Err() != nil {
-			s.jobs.Complete(fmt.Sprintf("Lookup cancelled after queueing %d.", enqueued))
-			return
-		}
-		if (i+1)%25 == 0 || i == total-1 {
-			s.jobs.Update(i+1, total, "looking up…")
-		}
-		var canonPath, sha string
-		if err := cx.DB.Read.QueryRow(
-			`SELECT canonical_path, sha256 FROM images WHERE id = ?`, id,
-		).Scan(&canonPath, &sha); err != nil {
-			continue
-		}
+	if opts.mode == "hash" && opts.ptr {
 		var err error
-		switch mode {
-		case "source":
-			queued, qErr := s.enqueueSourceFetches(ctx, cx, id, sha)
-			if qErr != nil {
-				if isMonloaderStatusErr(qErr) {
+		if matched, err = s.batchPTRLookup(ctx, cx, ids); err != nil {
+			if !errors.Is(err, errPTRUnavailable) && !errors.Is(err, errPTRBatchUnsupported) {
+				s.jobs.Fail("monloader unreachable: " + err.Error())
+				return
+			}
+			// monloader is the authority on whether it has an index to ask;
+			// the images were not skipped, the backend was simply not there.
+			ptrRefused = true
+		}
+	}
+	// A PTR-only hash lookup was finished by the batch call above, so the
+	// per-image walk - one row read each - would have nothing to do with what
+	// it read.
+	if opts.booru || opts.mode == "refresh" {
+		for i, id := range ids {
+			if ctx.Err() != nil {
+				s.jobs.Complete(fmt.Sprintf("Lookup cancelled after queueing %d.", enqueued))
+				return
+			}
+			if (i+1)%25 == 0 || i == total-1 {
+				s.jobs.Update(i+1, total, "looking up…")
+			}
+			var canonPath, sha string
+			if err := cx.DB.Read.QueryRow(
+				`SELECT canonical_path, sha256 FROM images WHERE id = ?`, id,
+			).Scan(&canonPath, &sha); err != nil {
+				continue
+			}
+			var err error
+			switch opts.mode {
+			case "refresh":
+				queued, qErr := s.enqueueSourceFetches(ctx, cx, id, sha)
+				if qErr != nil {
+					if isPeerStatusErr(qErr) {
+						skipped++
+						continue
+					}
+					s.jobs.Fail("monloader unreachable: " + qErr.Error())
+					return
+				}
+				if queued == 0 {
+					skipped++
+				} else {
+					enqueued += queued
+				}
+				continue
+			default:
+				md5, hashErr := gallery.Md5File(canonPath)
+				if hashErr != nil {
 					skipped++
 					continue
 				}
-				s.jobs.Fail("monloader unreachable: " + qErr.Error())
+				var jobID int64
+				if jobID, err = s.EnqueueHashLookup(ctx, id, cx.Name, "booru", md5, sha, true, false); err == nil {
+					s.recordLookupEnqueued(cx, id, "booru", jobID)
+				}
+			}
+			if err != nil {
+				// A per-request refusal (a bad hash) skips the row; only a
+				// transport failure means monloader is truly unreachable.
+				if isPeerStatusErr(err) {
+					skipped++
+					continue
+				}
+				s.jobs.Fail("monloader unreachable: " + err.Error())
 				return
 			}
-			if queued == 0 {
-				skipped++
-			} else {
-				enqueued += queued
-			}
-			continue
-		case "ptr":
-			if err = s.EnqueueHashLookup(ctx, id, galleryName, "ptr", "", sha); errors.Is(err, errPTRUnavailable) {
-				skipped++
-				continue
-			}
-		default:
-			md5, hashErr := gallery.Md5File(canonPath)
-			if hashErr != nil {
-				skipped++
-				continue
-			}
-			backend := "all"
-			if mode == "booru" {
-				backend = "booru"
-			}
-			err = s.EnqueueHashLookup(ctx, id, galleryName, backend, md5, sha)
+			enqueued++
 		}
-		if err != nil {
-			// A per-request refusal (a bad hash) skips the row; only a
-			// transport failure means monloader is truly unreachable.
-			if isMonloaderStatusErr(err) {
-				skipped++
-				continue
-			}
-			s.jobs.Fail("monloader unreachable: " + err.Error())
-			return
-		}
-		enqueued++
 	}
-	switch mode {
-	case "source":
+	cx.InvalidateCaches()
+	if opts.mode == "refresh" {
 		s.jobs.Complete(fmt.Sprintf("Queued %d source fetch(es) on monloader; skipped %d without a fetchable source.", enqueued, skipped))
-	case "ptr":
-		s.jobs.Complete(fmt.Sprintf("Queued %d PTR lookup(s) on monloader; skipped %d (PTR unavailable).", enqueued, skipped))
+		return
+	}
+	parts := []string{}
+	switch {
+	case ptrRefused:
+		parts = append(parts, "the PTR is unavailable on monloader")
+	case opts.ptr:
+		parts = append(parts, fmt.Sprintf("%d matched in the PTR", matched))
+	}
+	if opts.booru {
+		parts = append(parts, fmt.Sprintf("%d queued on monloader", enqueued))
+	}
+	if skipped > 0 {
+		parts = append(parts, fmt.Sprintf("%d skipped", skipped))
+	}
+	s.jobs.Complete(fmt.Sprintf("Looked up %d image(s): %s.", total, strings.Join(parts, ", ")))
+}
+
+// unsourcedOnly narrows a scope to the images that could still gain a
+// source, which is what makes "Find tags" over a big search affordable.
+func (s *Server) unsourcedOnly(cx *galleryCtx, ids []int64) []int64 {
+	var out []int64
+	for start := 0; start < len(ids); start += 500 {
+		chunk := ids[start:min(start+500, len(ids))]
+		placeholders, args := db.InPlaceholders(chunk)
+		found, err := db.QueryIDs(cx.DB.Read,
+			`SELECT i.id FROM images i WHERE i.id IN (`+placeholders+`)
+			   AND NOT EXISTS (SELECT 1 FROM image_sources s WHERE s.image_id = i.id AND s.url <> '')`,
+			args...)
+		if err != nil {
+			logx.Warnf("batch lookup scope narrowing: %v", err)
+			return ids
+		}
+		out = append(out, found...)
+	}
+	return out
+}
+
+// batchPTRLookup runs the scope through monloader's batch PTR endpoint in
+// chunks and applies every hit, recording each hash's outcome. Returns how
+// many matched.
+func (s *Server) batchPTRLookup(ctx context.Context, cx *galleryCtx, ids []int64) (int, error) {
+	g, ok := s.apiResolver(cx.Name)
+	if !ok {
+		return 0, errors.New("no active gallery")
+	}
+	matched := 0
+	for start := 0; start < len(ids) && ctx.Err() == nil; start += ptrLookupChunk {
+		chunk := ids[start:min(start+ptrLookupChunk, len(ids))]
+		byHash := map[string]int64{}
+		images := make([]ptrLookupImage, 0, len(chunk))
+		for _, id := range chunk {
+			var sha string
+			if err := cx.DB.Read.QueryRow(`SELECT sha256 FROM images WHERE id = ?`, id).Scan(&sha); err != nil {
+				continue
+			}
+			byHash[sha] = id
+			images = append(images, ptrLookupImage{ImageID: id, SHA256: sha})
+		}
+		if len(images) == 0 {
+			continue
+		}
+		results, cursor, err := s.ptrBatchLookup(ctx, cx.Name, false, images)
+		if err != nil {
+			return matched, err
+		}
+		// A record failure is logged inside and does not abort the batch: the
+		// scope is bounded and the operator asked for all of it.
+		hits, _, _ := applyPTRResults(g, cx, byHash, results, cursor)
+		matched += hits
+	}
+	return matched, nil
+}
+
+// runBatchSchedule sets the per-image scheduled-lookup opt-in across the
+// scope. Turning it on resets the ladder too, so this is the bulk equivalent
+// of the detail page's [look again] over a `lookup:exhausted` search. Both
+// backends move together: the per-backend choice belongs to the one image an
+// operator is looking at, not to a scope they picked in bulk.
+func (s *Server) runBatchSchedule(ctx context.Context, cx *galleryCtx, on bool, ids []int64) {
+	flag := 0
+	if on {
+		flag = 1
+	}
+	processed, cancelled, err := chunkedJob(ctx, s.jobs, ids, 500, "setting scheduled lookup", func(chunk []int64) error {
+		placeholders, args := db.InPlaceholders(chunk)
+		if _, err := cx.DB.Write.Exec(
+			`UPDATE images SET scheduled_lookup = ?, scheduled_lookup_ptr = ? WHERE id IN (`+placeholders+`)`,
+			append([]any{flag, flag}, args...)...); err != nil {
+			return err
+		}
+		if !on {
+			return nil
+		}
+		_, err := cx.DB.Write.Exec(
+			`UPDATE image_lookups SET attempts = 0, next_due_at = ?, ptr_cursor = NULL
+			 WHERE image_id IN (`+placeholders+`)`,
+			append([]any{time.Now().UTC().Format("2006-01-02T15:04:05Z")}, args...)...)
+		return err
+	})
+	cx.InvalidateCaches()
+	switch {
+	case err != nil:
+		s.jobs.Fail(err.Error())
+	case cancelled:
+		s.jobs.Complete(fmt.Sprintf("Scheduled lookup cancelled (%d/%d set)", processed, len(ids)))
+	case on:
+		s.jobs.Complete(fmt.Sprintf("Scheduled lookup turned on for %d image(s).", processed))
 	default:
-		s.jobs.Complete(fmt.Sprintf("Queued %d hash lookup(s) on monloader; skipped %d unreadable file(s).", enqueued, skipped))
+		s.jobs.Complete(fmt.Sprintf("Scheduled lookup turned off for %d image(s).", processed))
 	}
 }
 
@@ -915,6 +1101,7 @@ func (s *Server) enqueueSourceFetches(ctx context.Context, cx *galleryCtx, id in
 	rows, err := cx.DB.Read.Query(
 		`SELECT site, url FROM image_sources WHERE image_id = ? ORDER BY rowid`, id)
 	if err != nil {
+		logx.Warnf("source fetch origins for image %d: %v", id, err)
 		return 0, nil
 	}
 	type origin struct{ site, url string }
@@ -925,7 +1112,14 @@ func (s *Server) enqueueSourceFetches(ctx context.Context, cx *galleryCtx, id in
 			origins = append(origins, o)
 		}
 	}
+	iterErr := rows.Err()
 	_ = rows.Close()
+	// Fetching the origins a partial read did reach would queue less work than
+	// the summary claims, with nothing saying so.
+	if iterErr != nil {
+		logx.Warnf("source fetch origins for image %d: %v", id, iterErr)
+		return 0, nil
+	}
 
 	queued := 0
 	seenURL := map[string]bool{}
@@ -946,12 +1140,14 @@ func (s *Server) enqueueSourceFetches(ctx context.Context, cx *galleryCtx, id in
 				continue
 			}
 			ptrDone = true
-			if err := s.EnqueueHashLookup(ctx, id, galleryName, "ptr", "", sha); err != nil {
+			jobID, err := s.EnqueueHashLookup(ctx, id, galleryName, "ptr", "", sha, true, false)
+			if err != nil {
 				if errors.Is(err, errPTRUnavailable) {
 					continue
 				}
 				return queued, err
 			}
+			s.recordLookupEnqueued(cx, id, "ptr", jobID)
 		default:
 			continue
 		}

@@ -450,7 +450,8 @@ func (s *Server) lookupImage(w http.ResponseWriter, r *http.Request) {
 		hashes = "md5 " + md5
 	}
 	s.recordFetchLookup(galleryName, id, hashes)
-	if err := s.EnqueueHashLookup(r.Context(), id, galleryName, backend, md5, sha); err != nil {
+	jobID, err := s.EnqueueHashLookup(r.Context(), id, galleryName, backend, md5, sha, false, false)
+	if err != nil {
 		s.clearFetchStatus(galleryName, id)
 		if errors.Is(err, errPTRUnavailable) {
 			externalErr(w, r, err.Error(), http.StatusConflict)
@@ -459,6 +460,7 @@ func (s *Server) lookupImage(w http.ResponseWriter, r *http.Request) {
 		externalErr(w, r, "could not reach monloader: "+err.Error(), http.StatusBadGateway)
 		return
 	}
+	s.recordLookupEnqueued(cx, id, backend, jobID)
 	if isHTMXRequest(r) {
 		writeFetchPending(w, id, 0)
 		return

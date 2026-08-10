@@ -11,9 +11,9 @@
   {{range .Groups}}
   {{$color := .Color}}
   <div class="copy-tags-preview-group">
-    <h5 style="color:{{$color}}">{{.Category}}</h5>
+    <h5 style="color:{{catColor $color}}">{{.Category}}</h5>
     <ul class="copy-tags-preview-list">
-      {{range .Tags}}<li class="mono-small" style="color:{{$color}}">{{.}}</li>{{end}}
+      {{range .Tags}}<li class="mono-small" style="color:{{catColor $color}}">{{.}}</li>{{end}}
     </ul>
   </div>
   {{end}}

@@ -10,7 +10,7 @@
       {{range $groups}}
       <div class="tag-group" data-cat="{{.Name}}">
         <div class="tag-group-header">
-          <span class="cat-dot" style="background:{{.Color}}"></span>
+          <span class="cat-dot" style="background:{{catColor .Color}}"></span>
           <span class="cat-name">{{.Name}}</span>
           <button class="cat-collapse" title="Collapse">▾</button>
         </div>
@@ -19,13 +19,13 @@
           {{$q := printf "%s:%s" .CategoryName .Name}}
           {{$active := or (index $.ActiveTagTerms $q) (index $.ActiveTagTerms .Name)}}
           <li class="tag-entry" data-name="{{.Name}}">
-            <a href="/?q={{$q}}" class="tag-link" data-tag="{{$q}}" style="color:{{.CategoryColor}}">{{.Name}}</a>
+            <a href="/?q={{$q}}" class="tag-link" data-tag="{{$q}}" style="color:{{catColor .CategoryColor}}">{{.Name}}</a>
             {{if $active}}
             <button class="tag-add-btn btn-tag-add active" data-tag="{{$q}}" title="Remove from current search">-</button>
             {{else}}
             <button class="tag-add-btn btn-tag-add" data-tag="{{$q}}" title="Add to current search">+</button>
             {{end}}
-            <span class="tag-count">{{.UsageCount}}</span>
+            <span class="tag-count" title="images in the library with this tag">{{.UsageCount}}</span>
           </li>
           {{end}}
         </ul>

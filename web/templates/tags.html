@@ -193,15 +193,15 @@
       {{range .Tags}}
       {{$tag := .}}
       <tr class="tag-row" id="tag-row-{{.ID}}">
-        <td class="tag-select-col"><input type="checkbox" class="tag-select" value="{{.ID}}" data-name="{{.Name}}" data-color="{{.CategoryColor}}" data-category="{{.CategoryName}}" aria-label="Select {{.Name}}"></td>
+        <td class="tag-select-col"><input type="checkbox" class="tag-select" value="{{.ID}}" data-name="{{.Name}}" data-color="{{catColor .CategoryColor}}" data-category="{{.CategoryName}}" aria-label="Select {{.Name}}"></td>
         <td class="tag-name-cell{{if and (not .IsAlias) (eq .CategoryName "rating")}} tag-name-builtin{{end}}">
           {{if .IsAlias}}
-          <span style="color:{{.CategoryColor}}">{{.Name}}</span>
+          <span style="color:{{catColor .CategoryColor}}">{{.Name}}</span>
           <span class="merge-arrow">→</span>
-          <a href="/?q={{.CanonicalCategoryName}}:{{.CanonicalName}}" style="color:{{.CanonicalCategoryColor}}">{{.CanonicalName}}</a>
+          <a href="/?q={{.CanonicalCategoryName}}:{{.CanonicalName}}" style="color:{{catColor .CanonicalCategoryColor}}">{{.CanonicalName}}</a>
           <span class="alias-badge">alias</span>
           {{else}}
-          <a href="/?q={{.CategoryName}}:{{.Name}}" style="color:{{.CategoryColor}}">{{.Name}}</a>
+          <a href="/?q={{.CategoryName}}:{{.Name}}" style="color:{{catColor .CategoryColor}}">{{.Name}}</a>
           {{if .FoldedInto}}<span class="merge-arrow">→</span> <span class="field-hint">{{.FoldedInto}}</span>{{end}}
           {{if eq .CategoryName "rating"}}<span class="field-hint">(built-in)</span>{{end}}
           {{end}}
@@ -210,13 +210,13 @@
             {{with index $imps .ID}}title="{{range $i, $im := .}}{{if $i}} {{end}}{{$im.ImpliedName}}{{end}}"{{end}}>
           {{with index $imps .ID}}
             {{$n := len .}}
-            {{range $i, $im := .}}{{if lt $i 5}}{{if $i}} {{end}}<a href="/?q={{$im.ImpliedCategoryName}}:{{$im.ImpliedName}}" style="color:{{$im.ImpliedCategoryColor}}">{{$im.ImpliedName}}</a>{{end}}{{end}}
+            {{range $i, $im := .}}{{if lt $i 5}}{{if $i}} {{end}}<a href="/?q={{$im.ImpliedCategoryName}}:{{$im.ImpliedName}}" style="color:{{catColor $im.ImpliedCategoryColor}}">{{$im.ImpliedName}}</a>{{end}}{{end}}
             {{if gt $n 5}} <a class="tag-implied-more" href="/tags/{{$tag.ID}}">+{{sub $n 5}}</a>{{end}}
           {{end}}
         </td>
         <td>
           {{if eq .CategoryName "rating"}}
-          <span style="color:{{.CategoryColor}}">{{.CategoryName}}</span>
+          <span style="color:{{catColor .CategoryColor}}">{{.CategoryName}}</span>
           {{else}}
           <select class="cat-select"
                   aria-label="Category"
@@ -229,12 +229,13 @@
                   hx-on::after-request="onTagCategoryPatch(event, this)"
                   onchange="updateTagColor(this)">
             {{range $cats}}
-            <option value="{{.ID}}" data-color="{{.Color}}" {{if eq .ID $tag.CategoryID}}selected{{end}}>{{.Name}}</option>
+            <option value="{{.ID}}" data-color="{{catColor .Color}}" {{if eq .ID $tag.CategoryID}}selected{{end}}>{{.Name}}</option>
             {{end}}
           </select>
           {{end}}
         </td>
-        <td>{{.UsageCount}}{{if .StaleUsage}} <span class="field-hint">({{.StaleUsage}} stale)</span>{{end}}</td>
+        <td class="tag-usage-cell"
+            {{if .StaleUsage}}title="{{.UsageCount}} {{plural .UsageCount "image" "images"}}, {{.StaleUsage}} stale"{{end}}>{{.UsageCount}}</td>
         <td class="tag-origin-cell">
           {{if .Origin}}
           {{$kind := index $.OriginKinds .Origin}}
@@ -670,8 +671,11 @@ function tagScopeLabel() {
 }
 
 // The shared 202-response follow-up: latch the reload and let the job
-// status poller refresh once the background batch reports done.
+// status poller refresh once the background batch reports done. The
+// selection rides across that reload like the gallery's does, except under
+// the whole-search escalation, whose scope is a filter and not a row set.
 function tagBatchDone() {
+  if (!tagSelectAllMatching) stashSelection(selectedTagIds());
   _pendingGalleryReload = true;
   if (typeof refreshJobStatus === 'function') refreshJobStatus();
 }

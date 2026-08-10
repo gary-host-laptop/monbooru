@@ -321,6 +321,11 @@ func Bootstrap(db *DB) error {
 	b.ensureColumn("saved_searches", "sort_order", `ALTER TABLE saved_searches ADD COLUMN sort_order TEXT NOT NULL DEFAULT ''`)
 	b.ensureColumn("saved_searches", "seed", `ALTER TABLE saved_searches ADD COLUMN seed TEXT NOT NULL DEFAULT ''`)
 	b.ensureColumn("image_paths", "mtime_unix", `ALTER TABLE image_paths ADD COLUMN mtime_unix INTEGER NOT NULL DEFAULT 0`)
+	// The same stamp at full resolution. Seconds cannot tell an edit that
+	// landed in the same second the file was last observed, and 0 keeps a
+	// row written before this column on the second-grained comparison
+	// instead of re-hashing every file in the library once on upgrade.
+	b.ensureColumn("image_paths", "mtime_nsec", `ALTER TABLE image_paths ADD COLUMN mtime_nsec INTEGER NOT NULL DEFAULT 0`)
 	b.ensureColumn("images", "phash", `ALTER TABLE images ADD COLUMN phash INTEGER`)
 	// Which detector queued a pair, and the tag score behind it. The
 	// default keeps every row an existing library already holds on the
@@ -345,6 +350,17 @@ func Bootstrap(db *DB) error {
 	// index - it is only read for the page of rows the inbox cluster view
 	// already loaded, never filtered or sorted on.
 	b.ensureColumn("images", "upload_batch", `ALTER TABLE images ADD COLUMN upload_batch INTEGER`)
+	// The operator's per-image opt-out from the scheduled lookup, one
+	// column per backend so the per-image choice matches the per-phase one
+	// in Settings. 1 for existing rows: opting out is the exception, and
+	// nothing runs until a Schedule checkbox is on anyway. The PTR column
+	// is seeded from the single flag it splits off, so an opt-out made
+	// before the split keeps covering both backends.
+	b.ensureColumn("images", "scheduled_lookup", `ALTER TABLE images ADD COLUMN scheduled_lookup INTEGER NOT NULL DEFAULT 1`)
+	b.backfillIfFreshColumn("images", "scheduled_lookup_ptr",
+		`ALTER TABLE images ADD COLUMN scheduled_lookup_ptr INTEGER NOT NULL DEFAULT 1`,
+		`UPDATE images SET scheduled_lookup_ptr = scheduled_lookup`,
+		"backfill images.scheduled_lookup_ptr")
 	// Partial phash index: drives `phash:<hex>` exact-match seeks and
 	// the cold-path SELECT that loads the BK-tree at first relations
 	// query. Skips NULL rows (the BK-tree only carries computed phashes)
@@ -555,6 +571,21 @@ func Bootstrap(db *DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_image_tags_stale_tag ON image_tags(tag_id, image_id) WHERE stale = 1`)
 	b.exec("create idx_image_tags_stale_image",
 		`CREATE INDEX IF NOT EXISTS idx_image_tags_stale_image ON image_tags(image_id) WHERE stale = 1`)
+	// Two /tags sidebar counts scan the whole catalog on every render.
+	// idx_tags_active_name is covering for the conflicts scan - it carries
+	// name alone, which is why ConflictsCount counts rows rather than
+	// distinct categories - and idx_tags_origin covers both the origin
+	// histogram and the origin= filter.
+	b.exec("create idx_tags_active_name",
+		`CREATE INDEX IF NOT EXISTS idx_tags_active_name ON tags(name) WHERE is_alias = 0`)
+	b.exec("create idx_tags_origin",
+		`CREATE INDEX IF NOT EXISTS idx_tags_origin ON tags(origin)`)
+	// The created_at sort has no other key to seek on, so without this
+	// index its listing temp-sorts the catalog. last_used_at gets none
+	// deliberately: every tag application rewrites it, and the sort is
+	// cheap enough without one.
+	b.exec("create idx_tags_active_created",
+		`CREATE INDEX IF NOT EXISTS idx_tags_active_created ON tags(created_at DESC) WHERE is_alias = 0`)
 	// Per-tag source ledger: one row per (image, tag, source) so a tag
 	// several sources agree on shows every confirmation, not just the
 	// first-wins image_tags.tagger_name. Write paths record through

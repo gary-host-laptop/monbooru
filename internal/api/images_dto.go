@@ -158,6 +158,21 @@ type imageResponse struct {
 	// category:name form (bare for general). Populated on the single
 	// image GET only.
 	TagSources map[string][]string `json:"tag_sources,omitempty"`
+	// ScheduledLookup / ScheduledLookupPTR are the operator's per-image
+	// opt-ins for the two scheduled hash lookup phases; Lookup carries the
+	// recorded history per backend, absent when nothing has ever been
+	// tried. All on the single image GET only.
+	ScheduledLookup    *bool                 `json:"scheduled_lookup,omitempty"`
+	ScheduledLookupPTR *bool                 `json:"scheduled_lookup_ptr,omitempty"`
+	Lookup             map[string]lookupJSON `json:"lookup,omitempty"`
+}
+
+// lookupJSON is one backend's recorded lookup history.
+type lookupJSON struct {
+	LastAt     string `json:"last_at,omitempty"`
+	LastResult string `json:"last_result,omitempty"`
+	Attempts   int    `json:"attempts"`
+	NextDueAt  string `json:"next_due_at,omitempty"`
 }
 
 // collectionJSON is one membership in imageResponse.Collections. The

@@ -14,14 +14,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
 	meta "github.com/monbooru/monbooru/internal/metadata"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/search"
 	"github.com/monbooru/monbooru/internal/tagger"
-	"github.com/monbooru/monbooru/internal/tags"
 )
+
+// rankPageBudget caps the cold back-link rank. It resolves which page
+// Back returns to when no cached match list settles it, and the render
+// blocks on the answer, so it gets a slice of the detail budget rather
+// than all of it.
+const rankPageBudget = 150 * time.Millisecond
 
 // annotationView is one positional note ready for the overlay: the box
 // geometry as CSS percentages of the rendered image so it scales at any size.
@@ -100,6 +106,7 @@ type detailData struct {
 	IsManga           bool                  // shorthand for FileType == "cbz" so the template doesn't string-compare
 	MisnamedExt       string                // on-disk extension when it contradicts FileType, "" when they agree
 	ResumePage        int                   // reader bookmark for manga rows, 0 when unstarted or finished
+	MangaHint         string                // generate-collection dialog prefill: ComicInfo Series, else Title, else the archive filename stem
 	Collections       []models.Collection   // every collection this image belongs to, ordered for display
 	Sources           []models.ImageSource  // every origin this image came from, primary first
 	Annotations       []annotationView      // positional note boxes overlaid on the media
@@ -123,13 +130,15 @@ type detailData struct {
 	// `&` separators when the fragment is interpolated after `?page=N`.
 	BackQS         template.URL
 	BackKVQS       template.URL
-	EnabledTaggers []tagger.TaggerStatus      // enabled+available taggers offered in the auto-tag control
-	ImageTaggers   []string                   // distinct tagger names currently on this image's auto-tags
-	ImageSources   []string                   // distinct source labels currently carrying tags on this image (is_auto=0 with a tagger_name)
-	HasUserTags    bool                       // true when at least one operator-added manual tag is on this image
-	HasStaleTags   bool                       // true when at least one tag on this image is stale (a source dropped it)
-	Aliases        []models.Tag               // alias rows pointing at any non-implied tag on this image, flattened for display
-	TagSources     map[int64][]tags.TagSource // source ledger per tag id; feeds each source group's +N reveal (sourceExtraTags)
+	EnabledTaggers []tagger.TaggerStatus // enabled+available taggers offered in the auto-tag control
+	ImageTaggers   []string              // distinct tagger names currently on this image's auto-tags
+	ImageSources   []string              // distinct source labels currently carrying tags on this image (is_auto=0 with a tagger_name)
+	HasUserTags    bool                  // true when at least one operator-added manual tag is on this image
+	HasStaleTags   bool                  // true when at least one tag on this image is stale (a source dropped it)
+	TagSidebar     tagSidebar            // the sidebar's tag listing: sections, provenance markers, implied nesting
+	// Lookup is the image's scheduled-lookup state: the history line under
+	// the lookup button and the control in the Sources field.
+	Lookup lookupView
 	// PhashDistance is the configured Find-pairs Hamming distance used by
 	// the phash row's [search near-duplicates] link. Pulled live from
 	// Config.Relations.DefaultDistance so a settings tweak is honoured
@@ -141,6 +150,14 @@ type detailData struct {
 	// the one that refused it.
 	NoPreview   bool
 	PreviewNote string
+	// PreviewScaled says the media area is showing the bounded rendition
+	// rather than the file, which the operator has no other signal for -
+	// the picture just looks smaller than the Resolution row claims.
+	PreviewScaled bool
+	PreviewMaxDim int
+	// PluginSlot is the detail-actions mount point: the paired and static
+	// peers' buttons for this image, absent when no peer offers any.
+	PluginSlot pluginSlotView
 }
 
 // imageByHashHandler redirects /i/{sha} to the detail page of the image with
@@ -244,7 +261,8 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 	// Set only while the page is still unresolved, so the post-adjacency
 	// read below knows whether to look again.
 	pendingKey := ""
-	if wantAdjacent && s.cfg.UI.PageSize > 0 {
+	pageSize := s.pageSize()
+	if wantAdjacent && pageSize > 0 {
 		var seed int64
 		if backSort == "random" && backSeed != "" {
 			seed, _ = strconv.ParseInt(backSeed, 10, 64)
@@ -269,13 +287,17 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 			go func() {
 				defer close(rankReady)
 				sq := adjacentSearchQuery(backQ, backSort, backOrder, backSeed, ceiling)
-				ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+				// The render waits on this, so the deadline is the page's
+				// to spend: it names which page Back returns to, which is
+				// worth a fraction of the detail budget and not the whole
+				// of it. Overrunning keeps the page the URL carries.
+				ctx, cancel := context.WithTimeout(r.Context(), rankPageBudget)
 				defer cancel()
 				rank, err := search.RankInQuery(ctx, s.db(), sq, id)
 				if err != nil || rank < 0 {
 					return
 				}
-				rankPage = strconv.Itoa(rank/s.cfg.UI.PageSize + 1)
+				rankPage = strconv.Itoa(rank/pageSize + 1)
 			}()
 		}
 	}
@@ -301,10 +323,13 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		collections []models.Collection
 		sources     []models.ImageSource
 		annotations []models.Annotation
-		tagSources  map[int64][]tags.TagSource
+		sidebar     tagSidebar
+		lookupState lookupView
 		prevID      *int64
 		nextID      *int64
 	)
+	csrfToken := s.csrfToken(sessionFromContext(ctx))
+	tagMode := readTagModeCookie(r)
 	isManga := img.FileType == models.FileTypeCBZ
 	// Ingest records the type the bytes declare and leaves the file named
 	// as the operator named it, so the two can legitimately disagree.
@@ -313,17 +338,18 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		misnamedExt = strings.ToLower(filepath.Ext(img.CanonicalPath))
 	}
 	var wg sync.WaitGroup
-	wg.Add(8)
+	wg.Add(9)
 	go func() {
 		defer wg.Done()
 		_, imageTags, _ = s.tagSvc().GetImageTags(id)
-		tagSources, _ = s.tagSvc().TagSourcesForImage(id)
+		sidebar = s.buildTagSidebar(id, csrfToken, tagMode, imageTags)
 	}()
 	go func() { defer wg.Done(); sdMeta = loadSDMeta(ctx, s.db(), id) }()
 	go func() { defer wg.Done(); comfyMeta = loadComfyMeta(ctx, s.db(), id) }()
 	go func() { defer wg.Done(); imagePaths = loadImagePaths(ctx, s.db(), id) }()
 	go func() { defer wg.Done(); collections, _ = gallery.CollectionsForImage(s.db(), id) }()
 	go func() { defer wg.Done(); sources, _ = gallery.SourcesForImage(s.db(), id) }()
+	go func() { defer wg.Done(); lookupState = s.lookupViewFor(s.Active(), id) }()
 	go func() { defer wg.Done(); annotations, _ = gallery.AnnotationsForImage(s.db(), id) }()
 	go func() {
 		defer wg.Done()
@@ -361,7 +387,7 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		comfyNodes = meta.ParseComfyWorkflowNodes(comfyMeta.RawWorkflow)
 	}
 
-	enabledTaggers := tagger.EnabledTaggersForGallery(s.cfg, s.activeName)
+	enabledTaggers := tagger.EnabledTaggersForGallery(s.cfgSnapshot(), s.activeName)
 	imageTaggers := distinctTaggerNames(imageTags, true)
 	imageSources := distinctTaggerNames(imageTags, false)
 	hasUserTags := false
@@ -406,6 +432,11 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 			previewNote = budgetErr.Error()
 		}
 	}
+	var pxW, pxH int
+	if img.Width != nil && img.Height != nil {
+		pxW, pxH = *img.Width, *img.Height
+	}
+	previewScaled := !isManga && !gallery.IsVideoType(img.FileType) && gallery.NeedsViewRendition(pxW, pxH)
 
 	baseName := filepath.Base(img.CanonicalPath)
 	// Prefix the immediate parent folder so a tab strip with several
@@ -413,6 +444,17 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 	titleName := baseName
 	if parent := filepath.Base(filepath.Dir(img.CanonicalPath)); parent != "" && parent != "." && parent != "/" {
 		titleName = parent + "/" + baseName
+	}
+	mangaHint := ""
+	if isManga {
+		mangaHint = strings.TrimSuffix(baseName, filepath.Ext(baseName))
+		if mangaMeta != nil {
+			if series := strings.TrimSpace(mangaMeta.Series); series != "" {
+				mangaHint = series
+			} else if title := strings.TrimSpace(mangaMeta.Title); title != "" {
+				mangaHint = title
+			}
+		}
 	}
 	data := detailData{
 		baseData:          s.base(r, "gallery", fmt.Sprintf("%s - %s", titleName, s.booruName())),
@@ -426,6 +468,7 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		MangaMeta:         mangaMeta,
 		IsManga:           isManga,
 		MisnamedExt:       misnamedExt,
+		MangaHint:         mangaHint,
 		ResumePage:        resumePage(img),
 		Collections:       collections,
 		Sources:           sources,
@@ -450,11 +493,14 @@ func (s *Server) detailHandler(w http.ResponseWriter, r *http.Request) {
 		ImageSources:      imageSources,
 		HasUserTags:       hasUserTags,
 		HasStaleTags:      hasStaleTags,
-		Aliases:           s.aliasesForImageTags(imageTags),
-		TagSources:        tagSources,
+		TagSidebar:        sidebar,
+		Lookup:            lookupState,
 		PhashDistance:     s.findPairsDistance(),
 		NoPreview:         noPreview,
 		PreviewNote:       previewNote,
+		PreviewScaled:     previewScaled,
+		PreviewMaxDim:     gallery.ViewMaxDim,
+		PluginSlot:        s.pluginSlot(r, config.SlotDetailActions, id, img.FileType),
 	}
 	s.renderTemplate(w, "detail.html", data)
 }
@@ -526,7 +572,7 @@ func (s *Server) pageOfMatch(ids []int64, id int64) (string, bool) {
 	if i < 0 {
 		return "", false
 	}
-	return strconv.Itoa(i/s.cfg.UI.PageSize + 1), true
+	return strconv.Itoa(i/s.pageSize() + 1), true
 }
 
 // findAdjacentImages finds the prev/next image IDs in the given search context

@@ -36,12 +36,13 @@ var errAutotagOverCap = errors.New("autotag: search-scope cap reached")
 // caches, and posts the completion summary. itemNoun ("" or
 // "uploaded ") splices into the success / partial summaries.
 func (s *Server) spawnAutoTagJob(ids []int64, selected []tagger.TaggerStatus, logScope, itemNoun string) {
+	cfg := s.cfgSnapshot()
 	database := s.db()
 	cx := s.Active()
 	baseline := readVmRSS()
 	go func() {
 		ctx := s.jobs.Context()
-		skipped, err := tagger.RunWithTaggers(ctx, database, s.cfg, ids, selected, s.jobs, s.cfg.Tagger.ExecutionProvider, cx.MangaCacheDir())
+		skipped, err := tagger.RunWithTaggers(ctx, database, cfg, ids, selected, s.jobs, cfg.Tagger.ExecutionProvider, cx.MangaCacheDir())
 		_ = s.completeAutotagRun(cx, ctx, "", itemNoun, logScope, len(ids), skipped, baseline, err)
 	}()
 }
@@ -98,7 +99,9 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 		flashStatus(w, http.StatusServiceUnavailable, "Upload unavailable: gallery path is unreadable.")
 		return
 	}
-	maxBytes := int64(s.cfg.Gallery.MaxFileSizeMB) * 1024 * 1024
+	cfg := s.cfgSnapshot()
+	maxFileSizeMB := cfg.Gallery.MaxFileSizeMB
+	maxBytes := int64(maxFileSizeMB) * 1024 * 1024
 	// MaxFileSizeMB <= 0 disables the per-file cap (Sync and the watcher
 	// treat it the same way); skip MaxBytesReader entirely so a single
 	// 4 KiB total-body cap doesn't make every upload fail.
@@ -115,7 +118,7 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 	folderInput := strings.TrimSpace(r.FormValue("folder"))
 	// The inline inbox drop zone posts no folder field, so fall back to the
 	// operator's configured default; an explicit folder still wins.
-	folderInput = cmp.Or(folderInput, strings.TrimSpace(s.cfg.Gallery.DefaultUploadFolder))
+	folderInput = cmp.Or(folderInput, strings.TrimSpace(cfg.Gallery.DefaultUploadFolder))
 	taggerName := strings.TrimSpace(r.FormValue("tagger_name"))
 	files := r.MultipartForm.File["files"]
 	if len(files) == 0 {
@@ -283,7 +286,7 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&msg, ", %d without a preview", noPreview)
 	}
 	if oversized > 0 {
-		fmt.Fprintf(&msg, ", %d skipped (exceeds %d MB)", oversized, s.cfg.Gallery.MaxFileSizeMB)
+		fmt.Fprintf(&msg, ", %d skipped (exceeds %d MB)", oversized, maxFileSizeMB)
 	}
 	failed := unsupported + unsaved
 	if failed > 0 {
@@ -298,8 +301,8 @@ func (s *Server) uploadPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Optionally kick off auto-tagging on the newly uploaded images.
-	if autotagAfter && len(addedIDs) > 0 && tagger.IsAvailable(s.cfg) {
-		selected, selErr := selectTaggers(s.cfg, s.activeName, taggerName)
+	if autotagAfter && len(addedIDs) > 0 && tagger.IsAvailable(cfg) {
+		selected, selErr := selectTaggers(cfg, s.activeName, taggerName)
 		if selErr != nil {
 			fmt.Fprintf(&msg, " (autotag skipped: %s)", html.EscapeString(selErr.Error()))
 		} else if err := s.jobs.Start(models.JobTypeAutotag); err != nil {
@@ -330,8 +333,9 @@ func uploadErrorReasons(unsupported, unsaved int) string {
 }
 
 func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
-	if !tagger.IsAvailable(s.cfg) {
-		http.Error(w, "auto-tagger not available: "+tagger.UnavailableReason(s.cfg), http.StatusServiceUnavailable)
+	cfg := s.cfgSnapshot()
+	if !tagger.IsAvailable(cfg) {
+		http.Error(w, "auto-tagger not available: "+tagger.UnavailableReason(cfg), http.StatusServiceUnavailable)
 		return
 	}
 
@@ -341,7 +345,7 @@ func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
 	scope := strings.TrimSpace(r.FormValue("scope"))
 	taggerName := strings.TrimSpace(r.FormValue("tagger_name"))
 
-	selected, selErr := selectTaggers(s.cfg, s.activeName, taggerName)
+	selected, selErr := selectTaggers(cfg, s.activeName, taggerName)
 	if selErr != nil {
 		externalErr(w, r, selErr.Error(), http.StatusBadRequest)
 		return
@@ -410,8 +414,9 @@ func (s *Server) autotagTrigger(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) autotagImage(w http.ResponseWriter, r *http.Request) {
-	if !tagger.IsAvailable(s.cfg) {
-		reason := tagger.UnavailableReason(s.cfg)
+	cfg := s.cfgSnapshot()
+	if !tagger.IsAvailable(cfg) {
+		reason := tagger.UnavailableReason(cfg)
 		hxErr(w, r, "Auto-tagger not available: "+reason+".", "auto-tagger not available: "+reason, http.StatusServiceUnavailable)
 		return
 	}
@@ -425,7 +430,7 @@ func (s *Server) autotagImage(w http.ResponseWriter, r *http.Request) {
 	}
 	taggerName := strings.TrimSpace(r.FormValue("tagger_name"))
 
-	selected, selErr := selectTaggers(s.cfg, s.activeName, taggerName)
+	selected, selErr := selectTaggers(cfg, s.activeName, taggerName)
 	if selErr != nil {
 		externalErr(w, r, selErr.Error(), http.StatusBadRequest)
 		return
@@ -448,7 +453,7 @@ func (s *Server) autotagImage(w http.ResponseWriter, r *http.Request) {
 		// time for a single image, so CPU finishes faster even when the
 		// global provider is GPU.
 		ctx := s.jobs.Context()
-		skipped, err := tagger.RunWithTaggers(ctx, database, s.cfg, []int64{id}, selected, s.jobs, "cpu", cx.MangaCacheDir())
+		skipped, err := tagger.RunWithTaggers(ctx, database, cfg, []int64{id}, selected, s.jobs, "cpu", cx.MangaCacheDir())
 		cx.InvalidateCaches()
 		if ctx.Err() != nil {
 			s.jobs.Complete("auto-tagging cancelled")

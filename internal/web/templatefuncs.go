@@ -1,13 +1,10 @@
 package web
 
 import (
-	"cmp"
 	"fmt"
 	"html/template"
 	"math"
 	"net/url"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -44,6 +41,21 @@ func templateFuncs() template.FuncMap {
 			return r
 		},
 		"add": func(a, b int) int { return a + b },
+		// catColor renders a tag-category colour as a value a theme can
+		// restate. The variable is keyed on the colour itself rather than
+		// on the category, so a theme maps the palette monbooru ships
+		// (the shipped hues are tuned for the dark ground and read washed
+		// out on a light one) while a colour the operator picked at
+		// /categories - which no theme names - falls through to itself.
+		// Typed template.CSS to survive the style-attribute sanitizer,
+		// which is why the input is validated first: only the #rgb /
+		// #rrggbb shape the Categories form enforces gets through.
+		"catColor": func(color string) template.CSS {
+			if !tags.IsValidCategoryColor(color) {
+				return template.CSS(tags.SafeCategoryColor(color))
+			}
+			return template.CSS("var(--cat-" + strings.ToLower(strings.TrimPrefix(color, "#")) + "," + color + ")")
+		},
 		// urlQ percent-encodes a query value with uppercase hex pairs so
 		// the links the sidebar emits match the case the browser writes
 		// back into the address bar (browsers normalize to uppercase per
@@ -111,153 +123,6 @@ func templateFuncs() template.FuncMap {
 		"isPTRSite": func(site string) bool {
 			return strings.EqualFold(strings.TrimSpace(site), "ptr")
 		},
-		"groupByImageSource": func(tagList []models.ImageTag) []imageTagSourceGroup {
-			// Manual tags split by source: plain UI adds (empty tagger_name)
-			// land in the "user" bucket; API-supplied sources each get their
-			// own "Tags added by <source>" subsection. Auto rows keep the
-			// existing per-tagger grouping with the "auto-tagger" suffix.
-			// is_implied rows skip every source bucket - they render
-			// together with aliases inside the collapsed wrapper at the
-			// bottom of the under-image list.
-			var userTags []models.ImageTag
-			byUserSource := map[string]*imageTagSourceGroup{}
-			var userSourceOrder []string
-			byTagger := map[string]*imageTagSourceGroup{}
-			var order []string
-			for _, t := range tagList {
-				if t.IsImplied {
-					continue
-				}
-				if !t.IsAuto {
-					if t.TaggerName == "" {
-						userTags = append(userTags, t)
-						continue
-					}
-					// Stale rows split into their own group so the current fetch
-					// state stays readable at a glance.
-					key := t.TaggerName
-					if t.Stale {
-						key += "\x00stale"
-					}
-					if _, ok := byUserSource[key]; !ok {
-						name := t.TaggerName
-						if strings.EqualFold(name, "ptr") {
-							// The source label stays "ptr" (search, image_sources);
-							// only the heading spells it out.
-							name = "the Public Tag Repository"
-						}
-						title := "Tags added by " + name
-						if t.Stale {
-							title = "Stale tags added by " + name
-						}
-						userSourceOrder = append(userSourceOrder, key)
-						byUserSource[key] = &imageTagSourceGroup{
-							Source: t.TaggerName,
-							Kind:   "source",
-							Title:  title,
-							Stale:  t.Stale,
-						}
-					}
-					byUserSource[key].Tags = append(byUserSource[key].Tags, t)
-					continue
-				}
-				key := t.TaggerName
-				key = cmp.Or(key, "auto-tagger")
-				if _, ok := byTagger[key]; !ok {
-					order = append(order, key)
-					kind := "auto"
-					if t.TaggerName == "" {
-						// The `taggers` filter matches on the stored name, so
-						// nameless auto rows have no group-scoped removal.
-						kind = ""
-					}
-					byTagger[key] = &imageTagSourceGroup{
-						Source: key,
-						Kind:   kind,
-						Title:  "Tags added by the " + key + " auto-tagger",
-					}
-				}
-				byTagger[key].Tags = append(byTagger[key].Tags, t)
-			}
-			out := []imageTagSourceGroup{}
-			if len(userTags) > 0 {
-				out = append(out, imageTagSourceGroup{
-					Source: "user",
-					Kind:   "user",
-					Title:  "Tags added by the user",
-					Tags:   userTags,
-				})
-			}
-			// Current groups before the stale ones, whatever order the
-			// rows arrived in.
-			for _, k := range userSourceOrder {
-				if !byUserSource[k].Stale {
-					out = append(out, *byUserSource[k])
-				}
-			}
-			for _, k := range userSourceOrder {
-				if byUserSource[k].Stale {
-					out = append(out, *byUserSource[k])
-				}
-			}
-			for _, k := range order {
-				g := byTagger[k]
-				// Auto-tagger subgroups read more naturally ordered by the
-				// tagger's own confidence: the tags the model was most sure
-				// of sit at the top. User tags above keep the existing
-				// alphabetical-by-category-then-usage order.
-				sort.SliceStable(g.Tags, func(i, j int) bool {
-					ci, cj := 0.0, 0.0
-					if g.Tags[i].Confidence != nil {
-						ci = *g.Tags[i].Confidence
-					}
-					if g.Tags[j].Confidence != nil {
-						cj = *g.Tags[j].Confidence
-					}
-					return ci > cj
-				})
-				out = append(out, *g)
-			}
-			return out
-		},
-		"impliedFromImageTags": func(tagList []models.ImageTag) []models.ImageTag {
-			var out []models.ImageTag
-			for _, t := range tagList {
-				if t.IsImplied {
-					out = append(out, t)
-				}
-			}
-			return out
-		},
-		// sourceExtraTags lists the tags a source also applied but that
-		// display under another group (that source is not their first
-		// writer), so the group header can reveal the source's full
-		// contribution. The ledger keys match the group source: an empty
-		// tagger lands under "user" both here and in RecordTagSourceTx.
-		"sourceExtraTags": func(group imageTagSourceGroup, tagList []models.ImageTag, ledger map[int64][]tags.TagSource) []models.ImageTag {
-			if group.Stale {
-				// The current group of the same source already reveals the
-				// source's full contribution.
-				return nil
-			}
-			primary := map[int64]bool{}
-			for _, t := range group.Tags {
-				primary[t.TagID] = true
-			}
-			var out []models.ImageTag
-			for _, t := range tagList {
-				if t.IsImplied || primary[t.TagID] {
-					continue
-				}
-				for _, src := range ledger[t.TagID] {
-					if src.Source == group.Source {
-						out = append(out, t)
-						break
-					}
-				}
-			}
-			return out
-		},
 		"groupTagsByOrigin": func(list []models.Tag) []originTagGroup {
 			return groupByOriginStale(list,
 				func(t models.Tag) (string, bool) { return t.Origin, t.Stale },
@@ -286,32 +151,6 @@ func templateFuncs() template.FuncMap {
 				return origin
 			}
 		},
-		"autoConfPct": func(c *float64) string {
-			if c == nil {
-				return ""
-			}
-			return strconv.Itoa(int(*c * 100))
-		},
-		"groupByImageTags": func(tagList []models.ImageTag) []imageTagGroup {
-			// Sidebar consumer: skip implied rows. The user asked for them
-			// to render only in the under-image list (less visible there),
-			// not in the per-image sidebar where every tag would compete
-			// for the same column.
-			out := groupOrdered(tagList,
-				func(t models.ImageTag) bool { return t.IsImplied },
-				func(t models.ImageTag) string { return t.Category },
-				func(t models.ImageTag) *imageTagGroup { return &imageTagGroup{Name: t.Category, Color: t.Color} },
-				func(g *imageTagGroup, t models.ImageTag) { g.Tags = append(g.Tags, t) })
-			// Lift rating to the top so the effective rating sits where
-			// the eye lands first.
-			for i, g := range out {
-				if g.Name == "rating" && i > 0 {
-					out = append([]imageTagGroup{g}, append(out[:i], out[i+1:]...)...)
-					break
-				}
-			}
-			return out
-		},
 		"cancelTitle": func(jobType string) string {
 			// Tooltip for the job-status × button. Only the job types that
 			// observe ctx.Done() in their worker loop appear here.
@@ -332,6 +171,8 @@ func templateFuncs() template.FuncMap {
 				return "Stop phash backfill"
 			case "relations":
 				return "Stop find-pairs"
+			case "lookup":
+				return "Stop the lookup"
 			case "move":
 				return "Stop moving"
 			case "tag":
@@ -351,6 +192,20 @@ func templateFuncs() template.FuncMap {
 				return ""
 			}
 			return t.In(time.Local).Format("2006-01-02 15:04:05")
+		},
+		// localDate is localTime without the clock, for lines where the day
+		// is the whole answer (a lookup's next due date is weeks out).
+		"localDate": func(t time.Time) string {
+			return t.In(time.Local).Format("2006-01-02")
+		},
+		// lookupResultLabel renders a recorded outcome as the tail of the
+		// "Last looked up" line. An error leaves last_result untouched by
+		// design, so only a concluded hit or miss reaches this.
+		"lookupResultLabel": func(result string) string {
+			if result == "hit" {
+				return "tags applied"
+			}
+			return "no match"
 		},
 		"browseSortLabel": func(s string) string {
 			switch s {

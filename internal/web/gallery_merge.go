@@ -430,7 +430,7 @@ func (s *Server) MergeGallery(name, format string, upload io.Reader) error {
 	_ = tmp.Close()
 
 	var mergeErr error
-	maxFileSizeMB := s.cfg.Gallery.MaxFileSizeMB
+	maxFileSizeMB := s.maxFileSizeMB()
 	switch format {
 	case "db":
 		mergeErr = mergeFromDB(cx, tmpPath, maxFileSizeMB)

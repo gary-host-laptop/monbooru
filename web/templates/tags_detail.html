@@ -25,7 +25,7 @@
   </div>
 
   <h2 id="tag-detail-header">
-    <span id="tag-detail-name" style="color:{{.Tag.CategoryColor}}">{{.Tag.Name}}</span>
+    <span id="tag-detail-name" style="color:{{catColor .Tag.CategoryColor}}">{{.Tag.Name}}</span>
     {{if .Tag.IsAlias}}<span class="alias-badge">alias</span>{{end}}
     {{if .IsRating}}
     <span class="field-hint">(built-in rating)</span>
@@ -62,9 +62,9 @@
     <h3>Resolves to</h3>
     {{with .Canonical}}
     <div class="tag-canonical-card">
-      <span style="color:{{$.Tag.CategoryColor}}">{{$.Tag.Name}}</span>
+      <span style="color:{{catColor $.Tag.CategoryColor}}">{{$.Tag.Name}}</span>
       <span class="merge-arrow">→</span>
-      <a href="/tags/{{.ID}}" style="color:{{.CategoryColor}}">{{.Name}}</a>
+      <a href="/tags/{{.ID}}" style="color:{{catColor .CategoryColor}}">{{.Name}}</a>
       <span class="field-hint">{{.CategoryName}}</span>
       · usage {{.UsageCount}}
       · last used {{if .LastUsedAt.IsZero}}—{{else}}{{.LastUsedAt.Format "2006-01-02"}}{{end}}
@@ -83,7 +83,7 @@
        under it sit right. -->
   <div class="tag-detail-cols">
     <div>
-      <div class="tag-detail-inbound" style="border-color:{{.Tag.CategoryColor}}">
+      <div class="tag-detail-inbound" style="border-color:{{catColor .Tag.CategoryColor}}">
         <section class="tag-detail-section">
           <h3>Aliases pointing here</h3>
           {{if .Aliases}}
@@ -99,7 +99,7 @@
           <ul class="tag-list">
             {{range .Tags}}
             <li class="tag-item">
-              <a href="/tags/{{.ID}}" style="color:{{.CategoryColor}}" title="Alias details">{{.Name}}</a>
+              <a href="/tags/{{.ID}}" style="color:{{catColor .CategoryColor}}" title="Alias details">{{.Name}}</a>
               <button class="tag-remove-btn"
                       hx-delete="/tags/{{.ID}}"
                       hx-headers='{"X-CSRF-Token":"{{$csrf}}"}'
@@ -138,7 +138,7 @@
           <ul class="tag-list">
             {{range .Implications}}
             <li class="tag-item">
-              <a href="/tags/{{.ParentID}}" style="color:{{.ParentCategoryColor}}">{{.ParentName}}</a>
+              <a href="/tags/{{.ParentID}}" style="color:{{catColor .ParentCategoryColor}}">{{.ParentName}}</a>
               <button class="tag-remove-btn"
                       hx-delete="/tags/{{.ParentID}}/implications/{{$.Tag.ID}}"
                       hx-headers='{"X-CSRF-Token":"{{$csrf}}"}'
@@ -176,7 +176,7 @@
     </div>
 
     <div>
-      <div class="tag-detail-outbound" style="border-color:{{.Tag.CategoryColor}}">
+      <div class="tag-detail-outbound" style="border-color:{{catColor .Tag.CategoryColor}}">
         <section class="tag-detail-section">
           <h3>Implies</h3>
           <div id="implications-editor" data-tag-id="{{.Tag.ID}}">
@@ -240,7 +240,7 @@
       <label>Target category</label>
       <select name="category_id" id="detail-category-select">
         {{range .Categories}}
-        <option value="{{.ID}}" data-color="{{.Color}}" {{if eq .ID $.Tag.CategoryID}}selected{{end}}>{{.Name}}</option>
+        <option value="{{.ID}}" data-color="{{catColor .Color}}" {{if eq .ID $.Tag.CategoryID}}selected{{end}}>{{.Name}}</option>
         {{end}}
       </select>
     </div>

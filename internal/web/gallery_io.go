@@ -655,7 +655,7 @@ func (s *Server) ImportGallery(name, format string, upload io.Reader) error {
 	// Close the target DB and stop its watcher before touching on-disk state.
 	cx.close()
 
-	applyErr := applyImport(format, tmpPath, dbPath, thumbsPath, galleryPath, s.cfg.Gallery.MaxFileSizeMB)
+	applyErr := applyImport(format, tmpPath, dbPath, thumbsPath, galleryPath, s.maxFileSizeMB())
 
 	// Reopen regardless so we leave the gallery usable even after a failed import.
 	newCx, openErr := openGalleryCtx(config.Gallery{
@@ -669,7 +669,8 @@ func (s *Server) ImportGallery(name, format string, upload io.Reader) error {
 		return fmt.Errorf("reopen gallery: %w", openErr)
 	}
 	s.contexts[name] = newCx
-	newCx.startWatcher(s.cfg.Gallery.WatchEnabled, s.cfg.Gallery.MaxFileSizeMB, s.jobs)
+	watch, maxMB := s.watcherSettings()
+	newCx.startWatcher(watch, maxMB, s.jobs)
 	s.ctxMu.Unlock()
 
 	go newCx.warmCaches()

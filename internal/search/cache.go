@@ -33,7 +33,31 @@ const (
 	adjacencyCacheTTL        = 5 * time.Minute
 	adjacencyCacheMaxEntries = 4
 	adjacencyCacheMaxIDs     = 1000000
+	// adjacencyFanBudget floors how long Execute's page-1 fan may hold
+	// the request; adjacencyFanCostRatio raises that floor for a query
+	// that was already expensive to answer.
+	//
+	// The page query stops at its LIMIT. The fan has no early stop and
+	// walks the sort index until it has found every match, so its cost
+	// tracks the rows it walks, not the rows it returns - minutes, when
+	// the predicate probes hundreds of canonicals per row. Where the two
+	// costs are the same order the fan pays for itself: every page-flip
+	// and prev/next after it is a slice scan instead of a repeat of a
+	// query that was slow once, and the ratio is what keeps those fans
+	// alive. The floor covers the queries the page answers cheaply,
+	// where the fan is speculative and the plain path is a fine thing to
+	// fall back on. Overrunning cancels the read, leaves the entry
+	// unset, and the request serves the plain page - the state a query
+	// above adjacencyCacheMaxIDs is already in.
+	adjacencyFanBudget    = 750 * time.Millisecond
+	adjacencyFanCostRatio = 2
 )
+
+// fanBudget is how long the fan may run for a request that has already
+// spent spent getting to it.
+func fanBudget(spent time.Duration) time.Duration {
+	return max(adjacencyFanBudget, spent*adjacencyFanCostRatio)
+}
 
 type adjacencyCacheEntry struct {
 	ids       []int64
@@ -54,12 +78,22 @@ var (
 	// shape that's already cheap on a single page.
 	fanInFlightMu sync.Mutex
 	fanInFlight   = map[string]bool{}
+
+	// fanOverBudget holds the keys whose last fan came back empty, until
+	// the moment they may be tried again. Without it a query whose fan
+	// can't finish inside adjacencyFanBudget pays the whole budget on
+	// every page-1 hit and never has anything to show for it; with it
+	// the attempt is made once per cache lifetime and the pages in
+	// between serve straight off the plain query.
+	fanOverBudget = map[string]time.Time{}
 )
 
 // AdjacencyCacheTryAcquireFan returns true when the caller wins the
 // race to fan the match-ids for key. The winner must call
 // AdjacencyCacheReleaseFan on completion regardless of outcome.
 // Losers must not fan; the winning goroutine will populate the cache.
+// A key whose recent fan came back empty is refused until its hold-off
+// lapses.
 func AdjacencyCacheTryAcquireFan(key string) bool {
 	if key == "" {
 		return false
@@ -69,8 +103,26 @@ func AdjacencyCacheTryAcquireFan(key string) bool {
 	if fanInFlight[key] {
 		return false
 	}
+	if retryAt, held := fanOverBudget[key]; held {
+		if time.Now().Before(retryAt) {
+			return false
+		}
+		delete(fanOverBudget, key)
+	}
 	fanInFlight[key] = true
 	return true
+}
+
+// AdjacencyCacheMarkFanOverBudget records that key's fan produced
+// nothing to cache, so the next page-1 hit inside the cache lifetime
+// serves the plain query instead of spending the budget again.
+func AdjacencyCacheMarkFanOverBudget(key string) {
+	if key == "" {
+		return
+	}
+	fanInFlightMu.Lock()
+	fanOverBudget[key] = time.Now().Add(adjacencyCacheTTL)
+	fanInFlightMu.Unlock()
 }
 
 // AdjacencyCacheReleaseFan releases the in-flight gate so the next
@@ -150,17 +202,31 @@ func AdjacencyCacheDropForGallery(gallery string) {
 	adjCacheDrop(func(k string, _ adjacencyCacheEntry) bool {
 		return strings.HasPrefix(k, prefix)
 	})
+	dropFanHoldOffs(func(k string, _ time.Time) bool {
+		return strings.HasPrefix(k, prefix)
+	})
 }
 
 // AdjacencyCacheSweep drops every entry past its TTL. Get evicts one
 // on the way past and Set evicts by LRU, so without this an idle
 // process keeps expired lists - up to the cache's whole budget - until
-// something touches the cache again.
+// something touches the cache again. The fan hold-offs have no such
+// eviction of their own: nothing reads a key that stopped being asked
+// for, so the sweep is what keeps the map proportional to live traffic.
 func AdjacencyCacheSweep() {
 	now := time.Now()
 	adjCacheDrop(func(_ string, entry adjacencyCacheEntry) bool {
 		return now.After(entry.expiresAt)
 	})
+	dropFanHoldOffs(func(_ string, retryAt time.Time) bool {
+		return now.After(retryAt)
+	})
+}
+
+func dropFanHoldOffs(drop func(string, time.Time) bool) {
+	fanInFlightMu.Lock()
+	maps.DeleteFunc(fanOverBudget, drop)
+	fanInFlightMu.Unlock()
 }
 
 // adjCacheDrop removes every entry drop reports and rebuilds the LRU

@@ -1,5 +1,5 @@
 {{define "partials/implications_dialog.html"}}
-<p>Tags implied by <strong style="color:{{.Parent.CategoryColor}}">{{.Parent.Name}}</strong>:</p>
+<p>Tags implied by <strong style="color:{{catColor .Parent.CategoryColor}}">{{.Parent.Name}}</strong>:</p>
 {{if .Implications}}
 {{range groupImplicationsByOrigin .Implications}}
 {{if $.OriginKinds}}<p class="relation-origin-sub">{{if .Stale}}stale, {{end}}added by {{originLabel $.OriginKinds .Origin}}
@@ -12,7 +12,7 @@
           title="Remove every implication in this group">[×]</button>{{end}}</p>{{end}}
 <ul class="tag-list">
   {{range .Implications}}
-  <li class="tag-item" style="color:{{.ImpliedCategoryColor}}">
+  <li class="tag-item" style="color:{{catColor .ImpliedCategoryColor}}">
     <a href="/tags/{{.ImpliedID}}" class="tag-chip-name" title="Tag details">{{.ImpliedName}}</a>
     <button class="tag-remove-btn"
             hx-delete="/tags/{{.ParentID}}/implications/{{.ImpliedID}}"

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/monbooru/monbooru/internal/db"
+	"github.com/monbooru/monbooru/internal/lookup"
 	"github.com/monbooru/monbooru/internal/searchkw"
 	"github.com/monbooru/monbooru/internal/tags"
 )
@@ -1053,6 +1054,7 @@ var filterBuilders = map[string]func(*whereBuilder, FilterExpr) string{
 	"folderonly": (*whereBuilder).buildFolderonlyFilter,
 	"generated":  (*whereBuilder).buildGeneratedFilter,
 	"rating":     (*whereBuilder).buildRatingFilter,
+	"lookup":     (*whereBuilder).buildLookupFilter,
 }
 
 func (b *whereBuilder) buildFilterExpr(e FilterExpr) string {
@@ -1394,6 +1396,37 @@ func (b *whereBuilder) boolTagsPredicate(extra, val string) string {
 		return "1=0"
 	}
 	return b.imageTagsPredicate(extra, !v)
+}
+
+// buildLookupFilter matches on the scheduled hash lookup's per-image state.
+// `due` shares its predicate with the scheduler phases (internal/lookup), so
+// what the operator sees here is what tonight's run will work on; the other
+// four read the recorded history directly.
+func (b *whereBuilder) buildLookupFilter(e FilterExpr) string {
+	switch strings.ToLower(e.Val) {
+	case "never":
+		return `NOT EXISTS (SELECT 1 FROM image_lookups l WHERE l.image_id = i.id)`
+	case "due":
+		ptr, ptrArgs := lookup.DueClause(lookup.BackendPTR, time.Now())
+		booru, booruArgs := lookup.DueClause(lookup.BackendBooru, time.Now())
+		b.args = append(b.args, ptrArgs...)
+		b.args = append(b.args, booruArgs...)
+		// Each half carries its own candidate clause: the opt-in is per
+		// backend, so an image opted out of one is still due on the other.
+		return "((" + lookup.CandidateClause(lookup.BackendPTR) + " AND (" + ptr + "))" +
+			" OR (" + lookup.CandidateClause(lookup.BackendBooru) + " AND (" + booru + ")))"
+	case "missed":
+		return `EXISTS (SELECT 1 FROM image_lookups l WHERE l.image_id = i.id
+		          AND l.last_result = 'miss' AND l.next_due_at IS NOT NULL)`
+	case "exhausted":
+		return `EXISTS (SELECT 1 FROM image_lookups l WHERE l.image_id = i.id
+		          AND l.backend = 'booru' AND l.last_result = 'miss' AND l.next_due_at IS NULL)`
+	case "off":
+		// Either backend: the filter exists to find what the operator
+		// opted out of, and half an opt-out still counts.
+		return "(i.scheduled_lookup = 0 OR i.scheduled_lookup_ptr = 0)"
+	}
+	return "1=0"
 }
 
 // buildStaleFilter matches images carrying a source-dropped (stale) tag.

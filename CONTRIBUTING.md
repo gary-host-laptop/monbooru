@@ -1,10 +1,12 @@
 # Contributing
 
 This file covers monbooru and its companion repos (monloader,
-monsender, mondocs). Open issues and pull requests in the repo relevant to the change: app behavior here, downloading and site support in
+monsender, mondocs, monbooru-plugins). Open issues and pull requests in the repo relevant to the change: app behavior here, downloading and site support in
 [monloader](https://github.com/monbooru/monloader), the browser
 extension in [monsender](https://github.com/monbooru/monsender),
-documentation in [mondocs](https://github.com/monbooru/mondocs).
+documentation in [mondocs](https://github.com/monbooru/mondocs),
+plugin and theme listings in
+[monbooru-plugins](https://github.com/monbooru/monbooru-plugins).
 
 ## Bug reports and feature requests
 
@@ -99,6 +101,21 @@ works without an account when possible.
 
 See [site profiles](https://monbooru.github.io/mondocs/addons/monloader/development.html)
 in the monloader docs.
+
+## Plugins and themes (monbooru-plugins)
+
+A plugin is a program of your own that pairs with monbooru and can add buttons in the interfaces;
+a theme is a folder of CSS. Neither needs a change in monbooru.
+The pairing exchange, the button slots, the relay payload and the
+theme variable names are (in theory) a stable contract, so the plugin can be built against
+that, in any language, by anyone.
+
+Listings live in [monbooru-plugins](https://github.com/monbooru/monbooru-plugins): PR one
+row to `PLUGINS.md` or `THEMES.md` pointing at your repo. Listing is not
+review. Bugs in a listed plugin belong on that plugin's tracker.
+
+What belongs to monbooru instead is the contract itself: issues about pairing, relay calls, theme variables, proposals for new
+surface...
 
 ## Credit
 

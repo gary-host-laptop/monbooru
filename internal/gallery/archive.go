@@ -86,7 +86,7 @@ func OpenManga(path string) (*Manga, error) {
 		byPath[name] = f
 	}
 	sort.Slice(pages, func(i, j int) bool {
-		return naturalLess(strings.ToLower(pages[i].Path), strings.ToLower(pages[j].Path))
+		return NaturalLess(strings.ToLower(pages[i].Path), strings.ToLower(pages[j].Path))
 	})
 	if len(pages) == 0 {
 		_ = zr.Close()
@@ -183,11 +183,11 @@ func (m *Manga) PageCacheExt(n int) string {
 	return strings.ToLower(filepath.Ext(m.Pages[n].OriginalName))
 }
 
-// naturalLess returns true if a < b under natural ordering: numeric
+// NaturalLess returns true if a < b under natural ordering: numeric
 // runs compare as integers, non-numeric runs compare byte-by-byte.
 // Handles `1.jpg, 2.jpg, 10.jpg` correctly while preserving the usual
 // lex order on the rest. Inputs are assumed lowercased by the caller.
-func naturalLess(a, b string) bool {
+func NaturalLess(a, b string) bool {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
 		ai, aj := a[i], b[j]

@@ -103,6 +103,48 @@ func (s *Service) RenameCategory(id int64, newName string) error {
 	return err
 }
 
+// collideNamesShown caps how many names a collision reports; the point is
+// to name what to fix, not to print the whole category.
+const collideNamesShown = 5
+
+// ErrCategoryMoveCollision reports the names a category-delete move cannot
+// reparent because the destination already holds a tag under each.
+type ErrCategoryMoveCollision struct {
+	Names []string
+	More  int
+}
+
+func (e *ErrCategoryMoveCollision) Error() string {
+	msg := "tags named " + strings.Join(e.Names, ", ") + " already exist in the target category"
+	if e.More > 0 {
+		msg = fmt.Sprintf("%s (and %d more)", msg, e.More)
+	}
+	return msg
+}
+
+// collidingNames lists the tag names the category holds that the target
+// already has, capped for the message.
+func collidingNames(tx *sql.Tx, id, targetID int64) ([]string, error) {
+	rows, err := tx.Query(
+		`SELECT t.name FROM tags t
+		 WHERE t.category_id = ?
+		   AND EXISTS (SELECT 1 FROM tags o WHERE o.category_id = ? AND o.name = t.name)
+		 ORDER BY t.name`, id, targetID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	return names, rows.Err()
+}
+
 // isUniqueConstraintErr reports whether err is the SQLite UNIQUE
 // constraint violation (raw error code 2067). Detecting it via the
 // stringified message lets the handlers map a clean "name already
@@ -157,6 +199,11 @@ func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID i
 				return err
 			}
 		default: // "move"
+			// The rating category holds its four canonical rows and nothing
+			// else, the same refusal the single-tag move makes.
+			if s.ratingCatID != 0 && targetID == s.ratingCatID {
+				return ErrRatingTagImmutable
+			}
 			switch targetID {
 			case 0:
 				if err := tx.QueryRow(
@@ -178,6 +225,17 @@ func (s *Service) DeleteCategoryMoveOrDelete(id int64, action string, targetID i
 				case err != nil:
 					return err
 				}
+			}
+			// UNIQUE(name, category_id) makes the bulk reparent all-or-nothing,
+			// so the names that would collide are named before it runs rather
+			// than surfacing as the constraint's own error text.
+			clash, err := collidingNames(tx, id, targetID)
+			if err != nil {
+				return err
+			}
+			if len(clash) > 0 {
+				more := max(len(clash)-collideNamesShown, 0)
+				return &ErrCategoryMoveCollision{Names: clash[:min(len(clash), collideNamesShown)], More: more}
 			}
 			if _, err := tx.Exec(
 				`UPDATE tags SET category_id = ? WHERE category_id = ?`, targetID, id,

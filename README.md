@@ -36,6 +36,7 @@ Designed for organizing your local media collection, including AI-generated imag
 - **Inbox workflow** : new images land in the inbox for review
 - **Multiple galleries** in one instance, each with its own filesystem and database; per-gallery export/import; import data from supported booru applications
 - **REST API** for third-party integrations, with scoped bearer tokens, an OpenAPI spec, and built-in docs
+- **Plugins and themes support**: pair a sidecar app and it gets buttons in dedicated surfaces; drop it in the plugins (or themes) folder and monbooru launches and supervises it for you
 - **Monloader integration (optional)** ([monloader](https://github.com/monbooru/monloader)) pulls images and tags from supported boorus and galleries, and reverse-looks up your own images against boorus, similarity services (IQDB, SauceNAO), and the Hydrus Public Tag Repository to backfill tags and sources; when a matched post serves a better file than your local copy, one click replaces it in place; the PTR connection can also pull tag aliases and implications into your catalog
 - **Optional password login**
 
@@ -53,11 +54,16 @@ Monbooru is a self-hosted offline image organizer. Optional companions applicati
 
 ```mermaid
 flowchart LR
-    web["- Any booru or gallery supported by gallery-dl<br/>- Direct image URL"]
-    ptr["Hydrus<br/>Public Tag Repository"]
-    sender["<b>monsender</b><br/>browser extension"]
-    loader["<b>monloader</b><br/>downloader"]
-    booru(["<b>monbooru</b><br/>Your self-hosted booru"])
+    web["`- Any booru or gallery supported by gallery-dl
+- Direct image URL`"]
+    ptr["`Hydrus
+Public Tag Repository`"]
+    sender["`**monsender**
+browser extension`"]
+    loader["`**monloader**
+downloader`"]
+    booru(["`**monbooru**
+Your self-hosted booru`"])
 
     web -->|browse| sender
     sender -->|send URL| loader
@@ -66,7 +72,8 @@ flowchart LR
 
     booru -.->|lookup by hash| loader
     loader -.->|reverse lookup: md5 + similarity| web
-    ptr <-.->|"sync: sha256 tags + aliases + implications<br/>contribute back"| loader
+    ptr <-.->|"`sync: sha256 tags + aliases + implications
+contribute back`"| loader
 
     classDef hub  fill:#9d2235,stroke:#ef8f99,stroke-width:3px,color:#ffffff;
     classDef tool fill:#1a1818,stroke:#9d2235,stroke-width:1.5px,color:#e8e4e2;
@@ -79,6 +86,7 @@ flowchart LR
 - **monbooru** : this application; organizes, tags, and serves your collection. 
 - **[monloader](https://github.com/monbooru/monloader)** : downloader; fetches files and per-post metadata (via gallery-dl) and pushes them into a monbooru gallery over the REST API; also answers monbooru's reverse lookups (boorus, IQDB/SauceNAO, Hydrus PTR) and source refetches.
 - **[monsender](https://github.com/monbooru/monsender)** : browser extension; sends the URL of the page you're currently browsing to monloader.
+- **[monbooru-plugins](https://github.com/monbooru/monbooru-plugins)** : community registry; the list of third-party plugins and themes, plus the reference plugin and the starter theme to copy.
 
 
 ---
@@ -99,7 +107,7 @@ See the monbooru documentation for help. In-app, type `system:` in the search ba
 
 ## Acknowledgements
 
-This section covers monbooru and its companion repos ([monloader](https://github.com/monbooru/monloader), [monsender](https://github.com/monbooru/monsender), [mondocs](https://github.com/monbooru/mondocs)).
+This section covers monbooru and its companion repos ([monloader](https://github.com/monbooru/monloader), [monsender](https://github.com/monbooru/monsender), [mondocs](https://github.com/monbooru/mondocs), [monbooru-plugins](https://github.com/monbooru/monbooru-plugins)).
 
 Thanks to [@gary-host-laptop](https://github.com/gary-host-laptop) for sustained contributions over time. Every shipped contribution is credited in the release that ships it; see [CONTRIBUTING](CONTRIBUTING.md).
 

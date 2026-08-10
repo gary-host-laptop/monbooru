@@ -17,12 +17,12 @@
               hx-on::after-request="if(event.detail.successful){document.getElementById('job-status').setAttribute('hx-trigger','load');htmx.trigger('#job-status','load')}"
               style="display:inline">
           <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
-          <button type="submit" class="btn-sm{{if $emptyQueue}} btn-purple{{end}}">Find new pairs</button>
+          <button type="submit" class="btn-sm{{if $emptyQueue}} btn-success{{end}}">Find new pairs</button>
         </form>
         {{if $emptyQueue}}
         <button type="button" class="btn-sm" disabled title="Empty queue - find pairs first">Start a session</button>
         {{else}}
-        <a class="btn-sm btn-purple" href="/relations/session">Start a session</a>
+        <a class="btn-sm btn-success" href="/relations/session">Start a session</a>
         {{end}}
         <form hx-post="/relations/reset-skipped" hx-target="#flash-relations" hx-swap="innerHTML"
               hx-on::after-request="if(event.detail.successful){setTimeout(function(){window.location.reload()},1500)}"

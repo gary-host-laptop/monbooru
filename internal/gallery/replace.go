@@ -9,6 +9,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/lookup"
 )
 
 // ApplyReplacedFile swaps an image's bytes for the staged file, keeping the
@@ -77,9 +78,13 @@ func ApplyReplacedFile(database *db.DB, thumbnailsPath string, imageID int64, st
 		if _, err := tx.Exec(`DELETE FROM image_paths WHERE image_id = ? AND is_canonical = 0`, imageID); err != nil {
 			return fmt.Errorf("drop stale aliases: %w", err)
 		}
+		// The recorded lookup misses are about bytes this row no longer has.
+		if err := lookup.DeleteForImage(tx, imageID); err != nil {
+			return fmt.Errorf("drop lookup history: %w", err)
+		}
 		if _, err := tx.Exec(
-			`UPDATE image_paths SET path = ?, mtime_unix = ? WHERE image_id = ? AND is_canonical = 1`,
-			newPath, fi.ModTime().Unix(), imageID,
+			`UPDATE image_paths SET path = ?, mtime_unix = ?, mtime_nsec = ? WHERE image_id = ? AND is_canonical = 1`,
+			newPath, fi.ModTime().Unix(), fi.ModTime().UnixNano(), imageID,
 		); err != nil {
 			return fmt.Errorf("update canonical path: %w", err)
 		}

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -195,6 +197,43 @@ func (s *Server) imageContribPreview(rctx context.Context, id int64, sha string)
 	return s.monloaderContribPreview(ctx, sha, storage, implied)
 }
 
+// ptrUnattributed lists the image's tags the repository also holds but
+// that the local ledger does not record it as having applied. Carrying
+// a tag is not the same as having it from the repository: one a booru
+// supplied leaves the repository absent from the by-source view (§5.8)
+// even though it vouches for the tag too, and a pull is what records
+// that. So these are work to offer even though no tag would be added.
+func (s *Server) ptrUnattributed(id int64, preview *contribPreview) []string {
+	known := map[string]bool{}
+	for _, t := range preview.ToAdd {
+		if t.Status == "known" {
+			known[t.Tag] = true
+		}
+	}
+	if len(known) == 0 {
+		return nil
+	}
+	ledger, err := s.tagSvc().TagSourcesForImage(id)
+	if err != nil {
+		return nil
+	}
+	_, imageTags, _ := s.tagSvc().GetImageTags(id)
+	var out []string
+	for _, t := range imageTags {
+		name := tagFormName(t.Category, t.TagName)
+		if !known[name] || slices.ContainsFunc(ledger[t.TagID], isPTRSource) {
+			continue
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func isPTRSource(src tags.TagSource) bool {
+	return strings.EqualFold(src.Source, "ptr")
+}
+
 // ptrContribPanel renders the image-page panel body: a one-line summary
 // from one preview, or the zero-work / provisional state. Absent when
 // the gate is closed or the row is a cbz bundle, so the caller only
@@ -235,15 +274,21 @@ func (s *Server) ptrContribPanel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	canContribute, contribHint := s.contribHint()
+	unattributed := s.ptrUnattributed(id, preview)
 	s.renderTemplate(w, "partials/ptr_contrib_panel.html", map[string]any{
-		"ImageID":       id,
-		"NewCount":      len(newTags),
-		"PetitionCount": len(petitionTags),
-		"AllKnown":      hasKnown,
-		"NewTip":        strings.Join(newTags, "\n"),
-		"PetitionTip":   strings.Join(petitionTags, "\n"),
-		"CanContribute": canContribute,
-		"CanPull":       s.ptrPullOpen(),
+		"ImageID":           id,
+		"NewCount":          len(newTags),
+		"PetitionCount":     len(petitionTags),
+		"AllKnown":          hasKnown,
+		"NewTip":            strings.Join(newTags, "\n"),
+		"PetitionTip":       strings.Join(petitionTags, "\n"),
+		"UnattributedCount": len(unattributed),
+		"UnattributedTip":   strings.Join(unattributed, "\n"),
+		"CanContribute":     canContribute,
+		// A pull is worth offering when the repository holds tags this
+		// image lacks, and also when it merely holds tags the ledger has
+		// not credited it for - that is the attribution the pull writes.
+		"CanPull":       s.ptrPullOpen() && (len(petitionTags) > 0 || len(unattributed) > 0),
 		"ContribHint":   contribHint,
 		"Provisional":   preview.Provisional,
 		"FailedUploads": s.monloaderContribFailedSeed(),

@@ -14,13 +14,13 @@
       <span>{{.BooruName}}</span>
     </a>
     <nav id="nav">
-      <a href="/"        {{if and (eq .ActiveNav "gallery") (not .InboxNavActive)}} class="active"{{end}}>Images</a>
-      <a id="inbox-nav" href="/?q=inbox:true" {{if .InboxNavActive}} class="active"{{end}}>Inbox{{if gt .InboxCount 0}} ({{.InboxCount}}){{end}}</a>
-      <a href="/categories" {{if eq .ActiveNav "categories"}} class="active"{{end}}>Categories</a>
-      <a href="/tags"    {{if eq .ActiveNav "tags"}}    class="active"{{end}}>Tags</a>
-      <a href="/collections" {{if eq .ActiveNav "collections"}} class="active"{{end}}>Collections</a>
-      <a href="/relations" {{if eq .ActiveNav "relations"}} class="active"{{end}}>Relations</a>
-      <a href="/settings"{{if eq .ActiveNav "settings"}}class="active"{{end}}>Settings</a>
+      <a href="/" class="nav-images{{if and (eq .ActiveNav "gallery") (not .InboxNavActive)}} active{{end}}">Images</a>
+      <a id="inbox-nav" href="/?q=inbox:true" class="nav-inbox{{if .InboxNavActive}} active{{end}}">Inbox{{if gt .InboxCount 0}} ({{.InboxCount}}){{end}}</a>
+      <a href="/categories" class="nav-categories{{if eq .ActiveNav "categories"}} active{{end}}">Categories</a>
+      <a href="/tags" class="nav-tags{{if eq .ActiveNav "tags"}} active{{end}}">Tags</a>
+      <a href="/collections" class="nav-collections{{if eq .ActiveNav "collections"}} active{{end}}">Collections</a>
+      <a href="/relations" class="nav-relations{{if eq .ActiveNav "relations"}} active{{end}}">Relations</a>
+      <a href="/settings" class="nav-settings{{if eq .ActiveNav "settings"}} active{{end}}">Settings</a>
     </nav>
     <div id="topbar-right">
       <div id="job-status"

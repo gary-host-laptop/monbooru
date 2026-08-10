@@ -116,13 +116,13 @@ func (s *Server) SessionMiddleware(next http.Handler) http.Handler {
 		// Public paths inject "anon" session so CSRF works on the login form.
 		// The manifest joins them because browsers fetch it with credentials
 		// omitted: gated, it resolves to the login page and fails to parse.
-		if r.URL.Path == "/login" || r.URL.Path == "/manifest.json" || isStaticPath(r.URL.Path) {
+		if isPublicPath(r.URL.Path) || isStaticPath(r.URL.Path) {
 			ctx := context.WithValue(r.Context(), sessionContextKey, "anon")
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
 
-		if !s.cfg.Auth.EnablePassword {
+		if !s.authEnabled() {
 			// No auth - inject synthetic session so CSRF validation still works.
 			ctx := context.WithValue(r.Context(), sessionContextKey, "anon")
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -144,6 +144,18 @@ func (s *Server) SessionMiddleware(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), sessionContextKey, sessID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// isPublicPath lists the routes a browser reaches before it holds a
+// session. The operator assets are on it because the login page renders
+// them too, and gated they resolve to the login HTML - a stylesheet that
+// never applies and a favicon that never draws.
+func isPublicPath(path string) bool {
+	switch path {
+	case "/login", "/manifest.json", "/custom.css", "/custom.logo":
+		return true
+	}
+	return false
 }
 
 func isStaticPath(path string) bool {

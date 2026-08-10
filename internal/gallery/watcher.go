@@ -38,9 +38,10 @@ type Watcher struct {
 
 const debounceDelay = 500 * time.Millisecond
 
-// movedOutGrace outlasts the debounced ingest a move inside the tree
-// pairs with, so the destination has claimed the row before the vanished
-// source is judged gone.
+// movedOutGrace outlasts the debounced ingest a vanished file may pair
+// with, so whatever claims the row does so before the file is judged
+// gone: a move inside the tree re-ingests at the destination, and an
+// in-place replace rewrites the same path.
 const movedOutGrace = 2 * time.Second
 
 // debounceTimer pairs a pending timer with the deadline of its latest
@@ -146,7 +147,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 					// it with a Create for the destination; one that
 					// nothing claims took the file out of the library.
 					if event.Has(fsnotify.Rename) {
-						w.schedule(event.Name, movedOutGrace, w.reconcileMovedOut)
+						w.schedule(event.Name, movedOutGrace, w.reconcileVanished)
 					}
 					continue
 				}
@@ -171,9 +172,14 @@ func (w *Watcher) Run(ctx context.Context) error {
 				w.debounce(event.Name)
 			}
 
+			// A delete waits out the same grace as a move: replacing a
+			// file in place deletes and rewrites the same path when the
+			// staging dir and the gallery sit on different filesystems,
+			// and marking the row missing in between races the replace's
+			// own commit.
 			if event.Has(fsnotify.Remove) {
 				_ = w.fsw.Remove(event.Name)
-				w.markFileMissing(event.Name)
+				w.schedule(event.Name, movedOutGrace, w.reconcileVanished)
 			}
 
 		case err, ok := <-w.fsw.Errors:
@@ -300,11 +306,12 @@ func (w *Watcher) onDebounceFired(path string, e *debounceTimer) {
 	run(path)
 }
 
-// reconcileMovedOut marks the row at path missing when nothing has taken
+// reconcileVanished marks the row at path missing when nothing has taken
 // the file over in the meantime. A move inside the tree re-ingests at the
-// destination and repoints the row, which leaves markFileMissing nothing
-// to match; only a file that left the watched tree is still standing here.
-func (w *Watcher) reconcileMovedOut(path string) {
+// destination and repoints the row, and a replace puts new bytes back at
+// the same path; only a file that really left the library is still
+// standing here.
+func (w *Watcher) reconcileVanished(path string) {
 	if w.jobSuppressesIngest() {
 		return
 	}
@@ -354,8 +361,10 @@ func (w *Watcher) ingestFile(path string) {
 // markFileMissing flips is_missing=1 and rebalances the usage_count of
 // every tag the image was carrying, in one write transaction. usage_count
 // is the visible-image count for a tag, so removing an image from the
-// visible set has to decrement (and prune zero-usage tags) the same way
-// the manual recalc does.
+// visible set owes each of its tags a decrement. The raw UPDATE is
+// deliberate: it runs after is_missing = 1 in the same transaction, where
+// the guarded DropTagUsageTx helper would see a row it no longer counts
+// and refuse.
 func (w *Watcher) markFileMissing(path string) {
 	// filepath.Rel containment so a sibling directory sharing a prefix
 	// (/data/gallery vs /data/gallery_backup) is correctly rejected.

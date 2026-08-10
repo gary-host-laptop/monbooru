@@ -9,6 +9,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"strings"
 )
 
 // mustRandBytes returns n cryptographically-random bytes and terminates the
@@ -63,6 +64,14 @@ func (s *Server) CSRFMiddleware(next http.Handler) http.Handler {
 
 		// API routes are exempt
 		if len(r.URL.Path) >= 8 && r.URL.Path[:8] == "/api/v1/" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// So is a mounted plugin's own page: its forms are the peer's, with
+		// no monbooru token to carry. The mount is session-gated and reaches
+		// nothing but a peer the operator approved.
+		if strings.HasPrefix(r.URL.Path, pluginMountPrefix) {
 			next.ServeHTTP(w, r)
 			return
 		}

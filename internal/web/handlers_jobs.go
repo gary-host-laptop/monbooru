@@ -42,7 +42,7 @@ func (s *Server) syncTrigger(w http.ResponseWriter, r *http.Request) {
 	// guard in SwitchGallery refuses swaps while the sync runs, so these
 	// handles stay valid for the job's lifetime.
 	cx := s.Active()
-	maxFileSizeMB := s.cfg.Gallery.MaxFileSizeMB
+	maxFileSizeMB := s.maxFileSizeMB()
 	go func() {
 		ctx := s.jobs.Context()
 		// cx.Sync wraps gallery.Sync + InvalidateCaches so this caller

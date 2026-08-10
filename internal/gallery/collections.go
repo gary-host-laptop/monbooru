@@ -494,7 +494,7 @@ func SortCollectionByFilename(database *db.DB, name string) error {
 		return err
 	}
 	sort.SliceStable(members, func(i, j int) bool {
-		return naturalLess(strings.ToLower(members[i].filename), strings.ToLower(members[j].filename))
+		return NaturalLess(strings.ToLower(members[i].filename), strings.ToLower(members[j].filename))
 	})
 	ids := make([]int64, len(members))
 	for i, m := range members {
@@ -539,4 +539,39 @@ func CollectionCeilingHidden(database *db.DB, name string, excludeIDs []int64) (
 func CollectionMemberIDs(database *db.DB, name string) ([]int64, error) {
 	return db.QueryIDs(database.Read,
 		`SELECT image_id FROM image_collections WHERE name = ? COLLATE NOCASE`, name)
+}
+
+// CollectionCBZMembers returns every visible member of name (NOCASE) in
+// generation order: positioned members first by position, then unordered
+// members by natural filename order. Like rename and dissolve, the
+// rating ceiling does not filter the result.
+func CollectionCBZMembers(database *db.DB, name string) ([]CBZMember, error) {
+	rows, err := database.Read.Query(
+		`SELECT i.canonical_path, i.file_type, basename(i.canonical_path), c.position
+		 FROM image_collections c JOIN images i ON i.id = c.image_id
+		 WHERE c.name = ? AND i.is_missing = 0
+		 ORDER BY c.position IS NULL, c.position, c.image_id`, name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out, unordered []CBZMember
+	for rows.Next() {
+		var m CBZMember
+		var pos sql.NullInt64
+		if err := rows.Scan(&m.Path, &m.FileType, &m.filename, &pos); err != nil {
+			return nil, err
+		}
+		if pos.Valid {
+			out = append(out, m)
+		} else {
+			unordered = append(unordered, m)
+		}
+	}
+	// Numbered order wins; members without a position fall back to
+	// natural filename order.
+	sort.SliceStable(unordered, func(i, j int) bool {
+		return NaturalLess(strings.ToLower(unordered[i].filename), strings.ToLower(unordered[j].filename))
+	})
+	return append(out, unordered...), rows.Err()
 }

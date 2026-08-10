@@ -49,6 +49,15 @@ type comicInfoXML struct {
 	PageCount       *int     `xml:"PageCount,omitempty"`
 }
 
+// MarshalComicInfo renders the ComicInfo.xml document for a generated
+// archive: the collection label as Title and the page count. The inverse
+// of ParseComicInfo's read path, sharing its schema. No XML declaration
+// is emitted, matching how most archivers write the file.
+func MarshalComicInfo(title string, pageCount int) ([]byte, error) {
+	doc := comicInfoXML{Title: title, PageCount: &pageCount}
+	return xml.MarshalIndent(doc, "", "  ")
+}
+
 // ParseComicInfo locates ComicInfo.xml at the archive root
 // (case-insensitive root match), parses it, and returns a populated
 // MangaMetadata. Returns (nil, nil) when no ComicInfo file exists or

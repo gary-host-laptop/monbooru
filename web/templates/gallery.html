@@ -34,7 +34,8 @@
   <span id="batch-count">0 selected</span>
   <form id="batch-delete-form">
     <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
-    <button type="button" class="batch-bar-right" onclick="openTagSelectedDialog()">Add tags manually</button>
+    <span class="batch-bar-spacer"></span>
+    <button type="button" onclick="openTagSelectedDialog()">Add tags manually</button>
     <button type="button" onclick="openStripSelectedDialog()">Remove tags</button>
     {{if .EnabledTaggers}}<button type="button" class="btn-autotag" onclick="openBatchAutotagDialog('selection')">Auto-tag</button>{{end}}
     {{if .MonloaderUsable}}<button type="button" class="monloader-accent" onclick="openBatchLookupDialog('selection')">Find tags</button>{{end}}
@@ -49,6 +50,14 @@
     <button type="button" class="btn-danger" onclick="batchDeleteSelected()">Delete</button>
   </form>
 </div>
+
+{{/* A second bar so the built-in one keeps its layout; it shows and hides
+     with the selection it inherits its scope from. */}}
+{{if .PluginSlot.Any}}
+<div id="plugin-batch-bar">
+  {{template "partials/plugin_buttons.html" .PluginSlot}}
+</div>
+{{end}}
 
 <div id="gallery-grid">
 {{template "partials/thumbnail_grid.html" .}}
@@ -352,27 +361,40 @@
   </form>
 </dialog>
 
-<!-- Batch lookup dialog. One monloader job per image, so a large scope means
-     a long politeness-paced crawl that can't be drained from monbooru once
-     queued - hence the count confirm. -->
+<!-- Batch lookup dialog. Operation-first: refreshing sources you already
+     have and discovering ones you do not are unrelated jobs, and the
+     backends under a hash lookup are independent with different costs, so
+     they are checkboxes that state their own. The scope narrowing is what
+     keeps a 1,240-image search from queueing 812 lookups for images that
+     already carry a source. -->
 <dialog id="batch-lookup-dialog">
   <input type="hidden" id="batch-lookup-scope">
   <p>
-    Look up tags for
+    Find tags for
     {{template "batch_count" "batch-lookup"}}:
   </p>
   <div class="field">
-    <label style="display:block"><input type="radio" name="batch-lookup-mode" value="source" checked> Refresh tags from the declared source(s)</label>
-    <label style="display:block"><input type="radio" name="batch-lookup-mode" value="all"> Look up new sources by file hash and fetch{{if .MonloaderPTR}} (PTR and online boorus){{end}}</label>
-    {{if .MonloaderPTR}}
-    <label style="display:block"><input type="radio" name="batch-lookup-mode" value="ptr"> Look up in the Public Tag Repository only</label>
-    <label style="display:block"><input type="radio" name="batch-lookup-mode" value="booru"> Look up on online boorus only</label>
-    {{end}}
+    <label class="batch-lookup-op"><input type="radio" name="batch-lookup-mode" value="refresh" checked onchange="updateBatchLookupSummary()"> Refresh tags from declared sources</label>
+    <span class="field-hint batch-lookup-sub" id="batch-lookup-refresh-hint">&nbsp;</span>
+
+    <label class="batch-lookup-op"><input type="radio" name="batch-lookup-mode" value="hash" onchange="updateBatchLookupSummary()"> Look up by file hash</label>
+    <div class="batch-lookup-sub">
+      <label><input type="checkbox" id="batch-lookup-ptr" checked onchange="updateBatchLookupSummary()"> Public Tag Repository <span class="field-hint">local index, no quota</span></label>
+      <label><input type="checkbox" id="batch-lookup-booru" checked onchange="updateBatchLookupSummary()"> Online boorus <span class="field-hint">spends site quota, one request per image</span></label>
+      <label><input type="checkbox" id="batch-lookup-unsourced" checked onchange="updateBatchLookupSummary()"> Only images with no source <span class="field-hint" id="batch-lookup-unsourced-count"></span></label>
+    </div>
+
+    <label class="batch-lookup-op"><input type="radio" name="batch-lookup-mode" value="schedule" onchange="updateBatchLookupSummary()"> Set scheduled lookup</label>
+    <div class="batch-lookup-sub">
+      <label><input type="radio" name="batch-lookup-schedule" value="1" checked> On</label>
+      <label><input type="radio" name="batch-lookup-schedule" value="0"> Off</label>
+    </div>
   </div>
-  <p style="color:var(--fg-dim);font-size:12px">Queued jobs run on monloader and cannot be cancelled from here.</p>
+  <p class="batch-lookup-summary" id="batch-lookup-summary"></p>
+  <p style="color:var(--fg-dim);font-size:12px">Queued lookups run behind anything you are waiting on, and cannot be cancelled from here.</p>
   <div id="batch-lookup-flash"></div>
   <div class="dialog-actions">
-    <button type="button" onclick="confirmBatchLookup()">Find tags</button>
+    <button type="button" id="batch-lookup-submit" onclick="confirmBatchLookup()">Find tags</button>
     <button type="button" onclick="closeDialogAndRestoreParent('batch-lookup-dialog')">Cancel</button>
   </div>
 </dialog>
@@ -384,18 +406,84 @@
 // confirmBatchSimple skeletons - lives in main.js so other pages can
 // share it. Each dialog below only names its id prefix, endpoint, and
 // per-dialog extras.
+// _batchLookupCounts holds the scope split the server answered for the open
+// dialog, so the live summary can price each operation without guessing.
+var _batchLookupCounts = {total: 0, sourced: 0, unsourced: 0};
+
 function openBatchLookupDialog(scope) {
   openBatchDialog('batch-lookup', scope, {
-    radio: '#batch-lookup-dialog input[name="batch-lookup-mode"][value="source"]'
+    radio: '#batch-lookup-dialog input[name="batch-lookup-mode"][value="refresh"]',
+    beforeShow: function() {
+      _batchLookupCounts = {total: 0, sourced: 0, unsourced: 0};
+      updateBatchLookupSummary();
+      var params = ['_csrf=' + encodeURIComponent(csrfValue()), 'scope=' + encodeURIComponent(scope)]
+        .concat(scope === 'search' ? searchScopeParts() : (selectionScopeIds() || []));
+      fetch('/internal/batch-lookup/count', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRF-Token': csrfValue()},
+        body: params.join('&')
+      }).then(function(r) { return r.ok ? r.json() : null; }).then(function(c) {
+        if (c) _batchLookupCounts = c;
+        updateBatchLookupSummary();
+      }).catch(function() {});
+    }
   });
 }
 
-// confirmBatchLookup queues the picked lookup mode across the scope: a
-// monloader metadata refetch or a hash lookup per image.
-function confirmBatchLookup() {
+function batchLookupMode() {
   var checked = document.querySelector('#batch-lookup-dialog input[name="batch-lookup-mode"]:checked');
-  confirmBatchSimple('batch-lookup', '/internal/batch-lookup',
-    ['mode=' + encodeURIComponent(checked ? checked.value : 'source')], 'Lookup failed.');
+  return checked ? checked.value : 'refresh';
+}
+
+// updateBatchLookupSummary prices the picked operation against the scope and
+// kills the submit button at zero, so an empty combination cannot be posted.
+function updateBatchLookupSummary() {
+  var c = _batchLookupCounts;
+  var mode = batchLookupMode();
+  var ptr = document.getElementById('batch-lookup-ptr');
+  var booru = document.getElementById('batch-lookup-booru');
+  var unsourced = document.getElementById('batch-lookup-unsourced');
+  var summary = document.getElementById('batch-lookup-summary');
+  var submit = document.getElementById('batch-lookup-submit');
+  var refreshHint = document.getElementById('batch-lookup-refresh-hint');
+  var unsourcedCount = document.getElementById('batch-lookup-unsourced-count');
+
+  refreshHint.textContent = c.total
+    ? c.sourced + ' have a source. The other ' + c.unsourced + ' are skipped.' : '';
+  unsourcedCount.textContent = c.total ? c.unsourced + ' of ' + c.total : '';
+
+  var n = 0, text = '';
+  if (mode === 'refresh') {
+    n = c.sourced;
+    text = n + ' image(s) will be refreshed from their declared sources.';
+  } else if (mode === 'hash') {
+    n = unsourced.checked ? c.unsourced : c.total;
+    var backends = [];
+    if (ptr.checked) backends.push('PTR');
+    if (booru.checked) backends.push('online');
+    if (backends.length === 0) n = 0;
+    text = n + ' image(s) will be looked up' + (backends.length ? ': ' + backends.join(', ') : '') + '.';
+  } else {
+    n = unsourced ? c.unsourced : c.total;
+    text = 'Applies to the ' + n + ' image(s) with no source.';
+  }
+  summary.textContent = text;
+  submit.disabled = n === 0;
+}
+
+// confirmBatchLookup posts the picked operation across the scope.
+function confirmBatchLookup() {
+  var mode = batchLookupMode();
+  var params = ['mode=' + encodeURIComponent(mode)];
+  if (mode === 'hash') {
+    params.push('ptr=' + (document.getElementById('batch-lookup-ptr').checked ? '1' : '0'));
+    params.push('booru=' + (document.getElementById('batch-lookup-booru').checked ? '1' : '0'));
+    params.push('unsourced=' + (document.getElementById('batch-lookup-unsourced').checked ? '1' : '0'));
+  } else if (mode === 'schedule') {
+    var on = document.querySelector('#batch-lookup-dialog input[name="batch-lookup-schedule"]:checked');
+    params.push('on=' + encodeURIComponent(on ? on.value : '1'));
+  }
+  confirmBatchSimple('batch-lookup', '/internal/batch-lookup', params, 'Lookup failed.');
 }
 
 function openBatchDeleteDialog(scope) {
@@ -407,7 +495,7 @@ function confirmBatchDelete() {
   var scope = document.getElementById('batch-delete-scope').value;
   if (scope === 'search') {
     runBatchOp({endpoint: '/internal/delete-search', scope: 'search', params: searchScopeParts(),
-                dialogId: 'batch-delete-dialog', flashId: 'batch-delete-flash', failMsg: 'Delete failed.', clearOnOk: false});
+                dialogId: 'batch-delete-dialog', flashId: 'batch-delete-flash', failMsg: 'Delete failed.'});
     return;
   }
   var ids = selectionScopeIds();
@@ -711,9 +799,6 @@ function confirmBatchAutotag() {
   var form = document.getElementById('batch-autotag-form');
   if (!form) return;
   var tagger = (form.querySelector('input[name="tagger_name"]:checked') || {}).value || '';
-  // Auto-tag does not need _pendingGalleryReload (the job updates tags
-  // out-of-band and the user often wants to keep watching the grid).
-  // runBatchOp clears selection on selection scope by default.
   confirmBatchSimple('batch-autotag', '/internal/autotag',
     ['tagger_name=' + encodeURIComponent(tagger)], 'Auto-tag failed.');
 }

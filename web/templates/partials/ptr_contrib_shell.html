@@ -5,7 +5,7 @@
      handlers, keyed on the ids and data attributes emitted here. */}}
 
 {{/* Row name: a single colored tag, or an A -> B / A => B pair. */}}
-{{define "ptr_contrib_name"}}{{if .Pairs}}<span class="ptr-name"><span{{if .Row.AColor}} style="color:{{.Row.AColor}}"{{end}}>{{.Row.A}}</span> {{if eq .Row.Kind "sibling"}}-&gt;{{else}}=&gt;{{end}} <span{{if .Row.BColor}} style="color:{{.Row.BColor}}"{{end}}>{{.Row.B}}</span></span>{{else}}<span class="ptr-name"{{if .Row.Color}} style="color:{{.Row.Color}}"{{end}}>{{.Row.Tag}}</span>{{end}}{{end}}
+{{define "ptr_contrib_name"}}{{if .Pairs}}<span class="ptr-name"><span{{if .Row.AColor}} style="color:{{catColor .Row.AColor}}"{{end}}>{{.Row.A}}</span> {{if eq .Row.Kind "sibling"}}-&gt;{{else}}=&gt;{{end}} <span{{if .Row.BColor}} style="color:{{catColor .Row.BColor}}"{{end}}>{{.Row.B}}</span></span>{{else}}<span class="ptr-name"{{if .Row.Color}} style="color:{{catColor .Row.Color}}"{{end}}>{{.Row.Tag}}</span>{{end}}{{end}}
 
 {{/* Context row: a fixed Note, else the row's own note (only the
      ineligible lists reach that branch, and their row types carry a

@@ -52,6 +52,7 @@
         <button type="button" class="btn-link-accent btn-rename-collection" data-name="{{.Name}}">[rename]</button>
         <button type="button" class="btn-link-accent btn-reorder-collection" data-name="{{.Name}}">[reorder]</button>
         <button type="button" class="btn-link-accent btn-dissolve-collection" data-name="{{.Name}}">[dissolve]</button>
+        <button type="button" class="btn-link-accent btn-generate-cbz" data-name="{{.Name}}" title="Pack this collection's images into a new .cbz item in the gallery">[generate cbz]</button>
         {{template "partials/collection_find_relations.html" (dict "Name" .Name "FindRelations" .FindRelations "CSRFToken" $.CSRFToken)}}
       </div>
       <div class="collection-preview">
@@ -349,12 +350,30 @@ function confirmDissolveCollection(btn) {
   }, 'The images and the files on disk are not deleted.', 'Dissolve');
 }
 
+function confirmGenerateCBZ(btn) {
+  var name = btn.dataset.name;
+  showConfirm('Generate a .cbz from "' + name + '"?', function() {
+    postForm('/collections/generate-cbz', {collection: name}, {
+      okStatus: 202,
+      flashId: 'collection-flash',
+      failMsg: 'Generation failed.',
+      catchMsg: 'Generation request failed.',
+      onOK: function() {
+        _pendingGalleryReload = true;
+        if (typeof refreshJobStatus === 'function') refreshJobStatus();
+      }
+    });
+  }, 'The collection itself is not modified; its images become the pages of a new manga item.', 'Generate cbz');
+}
+
 document.addEventListener('click', function(e) {
   if (!e.target.closest) return;
   var el = e.target.closest('.btn-rename-collection');
   if (el) { openCollectionRename(el); return; }
   el = e.target.closest('.btn-reorder-collection');
   if (el) { openCollectionOrder(el); return; }
+  el = e.target.closest('.btn-generate-cbz');
+  if (el) { confirmGenerateCBZ(el); return; }
   el = e.target.closest('.btn-dissolve-collection');
   if (el) { confirmDissolveCollection(el); }
 });

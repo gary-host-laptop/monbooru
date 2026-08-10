@@ -8,7 +8,7 @@ import (
 )
 
 func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
-	if !s.cfg.Auth.EnablePassword {
+	if !s.authEnabled() {
 		// Render the login page with an inline notice instead of silently
 		// redirecting - a user who bookmarked /login after disabling auth
 		// otherwise gets no explanation for why the page vanished. The
@@ -24,14 +24,16 @@ func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 }
 
 // loginPageData builds the data map for login.html. The login screen does
-// not run through s.base(), so the brand-name and logo overrides have to
-// be threaded explicitly - otherwise the configured brand would change
-// every page except the login one.
+// not run through s.base(), so the brand-name, logo, and custom-stylesheet
+// overrides have to be threaded explicitly - otherwise the configured brand
+// would change every page except the login one.
 func (s *Server) loginPageData(extra map[string]any) map[string]any {
 	data := map[string]any{
+		"Title":        "Login - " + s.booruName(),
 		"CSRFToken":    s.csrfToken("anon"),
 		"BooruName":    s.booruName(),
 		"BooruFavicon": s.booruFaviconURL(),
+		"CustomCSS":    s.customCSSPath() != "",
 	}
 	for k, v := range extra {
 		data[k] = v
@@ -40,7 +42,7 @@ func (s *Server) loginPageData(extra map[string]any) map[string]any {
 }
 
 func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
-	if !s.cfg.Auth.EnablePassword {
+	if !s.authEnabled() {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
@@ -56,7 +58,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 
 	password := r.FormValue("password")
 	if err := bcrypt.CompareHashAndPassword(
-		[]byte(s.cfg.Auth.PasswordHash), []byte(password),
+		[]byte(s.passwordHash()), []byte(password),
 	); err != nil {
 		s.loginRL.recordFailure(ip)
 		logx.Warnf("login failed from %s", ip)
@@ -68,7 +70,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	s.loginRL.recordSuccess(ip)
 	logx.Infof("login success from %s", ip)
 
-	sessID, err := s.sessions.NewSession(s.cfg.Auth.SessionLifetimeDays)
+	sessID, err := s.sessions.NewSession(s.sessionLifetimeDays())
 	if err != nil {
 		http.Error(w, "session error", http.StatusInternalServerError)
 		return
@@ -78,7 +80,7 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 		Name:     "monbooru_session",
 		Value:    sessID,
 		Path:     "/",
-		MaxAge:   s.cfg.Auth.SessionLifetimeDays * 86400,
+		MaxAge:   s.sessionLifetimeDays() * 86400,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
@@ -102,7 +104,7 @@ func (s *Server) logoutPost(w http.ResponseWriter, r *http.Request) {
 // auth state without requiring a page reload.
 func (s *Server) renderAuthPasswordOOB(w http.ResponseWriter, r *http.Request) {
 	s.renderTemplate(w, "partials/auth_password_section.html", map[string]any{
-		"AuthEnabled": s.cfg.Auth.EnablePassword,
+		"AuthEnabled": s.authEnabled(),
 		"CSRFToken":   s.csrfToken(sessionFromContext(r.Context())),
 		"OOB":         true,
 	})

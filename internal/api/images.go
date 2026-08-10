@@ -19,12 +19,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "golang.org/x/image/webp" // register webp decoder for canDecodeImage
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/lookup"
 	"github.com/monbooru/monbooru/internal/models"
 	"github.com/monbooru/monbooru/internal/search"
 	"github.com/monbooru/monbooru/internal/tagger"
@@ -150,7 +152,10 @@ type mergeSummary struct {
 // A booru origin arriving while the primary is the url-less "ptr" row takes
 // the primary over: a lookup that hits both backends should lead with the
 // booru post, whatever order monloader's enrich calls landed in.
-func (h *Handler) mergeSource(g Gallery, imageID int64, source, postID, url, md5, parentURL string, rawTags []string) (mergeSummary, []string, error) {
+//
+// Takes no receiver so ApplyPTRTags can hand the batch PTR pass the same
+// path a per-image enrich walks.
+func mergeSource(g Gallery, imageID int64, source, postID, url, md5, parentURL string, rawTags []string) (mergeSummary, []string, error) {
 	var sum mergeSummary
 	if source != "" || url != "" {
 		if err := writeSourceProvenance(g, imageID, source, postID, url, md5, parentURL); err != nil {
@@ -169,7 +174,7 @@ func (h *Handler) mergeSource(g Gallery, imageID int64, source, postID, url, md5
 	}
 	var warnings []string
 	if source != "" && len(rawTags) > 0 {
-		tagIDs, warns := h.resolveTagNames(g, rawTags, source)
+		tagIDs, warns := resolveTagNames(g, rawTags, source)
 		warnings = warns
 		// The per-site tag slice is shared by every post of that site on the
 		// image, so the reconcile only runs while this origin is the site's
@@ -290,7 +295,7 @@ func (h *Handler) enrichImage(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	sum, tagWarnings, err := h.mergeSource(g, id, source, postID, strings.TrimSpace(body.URL), sourceMD5, parentURL, body.Tags)
+	sum, tagWarnings, err := mergeSource(g, id, source, postID, strings.TrimSpace(body.URL), sourceMD5, parentURL, body.Tags)
 	if err != nil {
 		g.recordFetch(id, "error", "fetch failed while applying tags")
 		apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
@@ -322,6 +327,10 @@ func (h *Handler) enrichImage(w http.ResponseWriter, r *http.Request) {
 	}
 	g.invalidate()
 	g.recordFetch(id, "ok", fetchSummary(sum, len(body.Tags)))
+	// A hash lookup reports its hit by enriching, so an enrich landing on an
+	// image with an attempt in flight concludes it. The source implies which
+	// backend answered.
+	recordLookupHit(g, id, source)
 	resp := map[string]any{"merge": sum, "verified": verified}
 	if len(tagWarnings) > 0 {
 		resp["tag_warnings"] = tagWarnings
@@ -369,7 +378,53 @@ func (h *Handler) fetchStatusReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g.recordFetch(id, body.State, body.Message)
+	recordLookupTerminal(g, id, body.State)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ApplyPTRTags folds a batch PTR hit into an image exactly as a per-image
+// PTR enrich does: the url-less `ptr` origin, the source-attributed tags, and
+// the same reconcile with the same stale semantics. The scheduled PTR phase
+// reads the hashes from monloader in bulk and applies them itself, so this is
+// what keeps both paths writing one set of rules.
+func ApplyPTRTags(g Gallery, imageID int64, tags []string) error {
+	if _, _, err := mergeSource(g, imageID, "ptr", "", "", "", "", tags); err != nil {
+		return err
+	}
+	g.invalidate()
+	return nil
+}
+
+// recordLookupHit concludes an in-flight attempt on the backend the enrich's
+// source implies: the PTR labels its own writes, anything else came off the
+// online walk.
+func recordLookupHit(g Gallery, imageID int64, source string) {
+	backend := lookup.BackendBooru
+	if strings.EqualFold(strings.TrimSpace(source), "ptr") {
+		backend = lookup.BackendPTR
+	}
+	if err := lookup.RecordInFlight(g.DB, imageID, backend, lookup.ResultHit, time.Now()); err != nil {
+		logx.Warnf("api: lookup hit for image %d: %v", imageID, err)
+	}
+}
+
+// recordLookupTerminal concludes whatever the image has in flight from a
+// pre-enrich report. Only hash_not_found is evidence about the image; a
+// dropped job and every failure code are evidence about the plumbing, so they
+// clear the in-flight state and leave the ladder where it was.
+func recordLookupTerminal(g Gallery, imageID int64, state string) {
+	var result string
+	switch state {
+	case "pending", "ok":
+		return
+	case "hash_not_found":
+		result = lookup.ResultMiss
+	default:
+		result = lookup.ResultError
+	}
+	if err := lookup.RecordInFlight(g.DB, imageID, "", result, time.Now()); err != nil {
+		logx.Warnf("api: lookup outcome for image %d: %v", imageID, err)
+	}
 }
 
 // replaceImageFile handles POST /api/v1/images/{id}/file: the file-carrying
@@ -462,7 +517,7 @@ func (h *Handler) replaceImageFile(w http.ResponseWriter, r *http.Request) {
 	newMD5 := hex.EncodeToString(md5H.Sum(nil))
 
 	applyMeta := func() (mergeSummary, []string, bool) {
-		sum, tagWarnings, err := h.mergeSource(g, id, source, postID, url, claimedMD5, parentURL, tags)
+		sum, tagWarnings, err := mergeSource(g, id, source, postID, url, claimedMD5, parentURL, tags)
 		if err != nil {
 			g.recordFetch(id, "error", "replace failed while applying tags")
 			apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
@@ -664,7 +719,40 @@ func (h *Handler) buildImageResponse(g Gallery, imageID int64) (*imageResponse, 
 			resp.Annotations = append(resp.Annotations, annotationJSON{Site: a.Site, PostID: a.PostID, X: a.X, Y: a.Y, W: a.W, H: a.H, Body: a.Body})
 		}
 	}
+	addLookupState(g, imageID, &resp)
 	return &resp, nil
+}
+
+// addLookupState fills the scheduled-lookup opt-in and the recorded history.
+// Both are read-only reporting; a failure logs and leaves them absent rather
+// than failing the whole image read.
+func addLookupState(g Gallery, imageID int64, resp *imageResponse) {
+	var on, ptrOn bool
+	if err := g.DB.Read.QueryRow(
+		`SELECT scheduled_lookup, scheduled_lookup_ptr FROM images WHERE id = ?`, imageID,
+	).Scan(&on, &ptrOn); err != nil {
+		logx.Warnf("buildImageResponse scheduled_lookup: %v", err)
+		return
+	}
+	resp.ScheduledLookup, resp.ScheduledLookupPTR = &on, &ptrOn
+	rows, err := lookup.ForImage(g.DB, imageID)
+	if err != nil {
+		logx.Warnf("buildImageResponse lookup history: %v", err)
+		return
+	}
+	for backend, r := range rows {
+		entry := lookupJSON{LastResult: r.LastResult, Attempts: r.Attempts}
+		if !r.LastAt.IsZero() {
+			entry.LastAt = r.LastAt.Format(time.RFC3339)
+		}
+		if !r.NextDueAt.IsZero() {
+			entry.NextDueAt = r.NextDueAt.Format(time.RFC3339)
+		}
+		if resp.Lookup == nil {
+			resp.Lookup = map[string]lookupJSON{}
+		}
+		resp.Lookup[backend] = entry
+	}
 }
 
 func (h *Handler) getImage(w http.ResponseWriter, r *http.Request) {
@@ -700,12 +788,14 @@ func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Source          *string `json:"source"`
-		URL             *string `json:"url"`
-		Collection      *string `json:"collection"`
-		CollectionOrder *int    `json:"collection_order"`
-		IsFavorited     *bool   `json:"is_favorited"`
-		IsInbox         *bool   `json:"is_inbox"`
+		Source             *string `json:"source"`
+		URL                *string `json:"url"`
+		Collection         *string `json:"collection"`
+		CollectionOrder    *int    `json:"collection_order"`
+		IsFavorited        *bool   `json:"is_favorited"`
+		IsInbox            *bool   `json:"is_inbox"`
+		ScheduledLookup    *bool   `json:"scheduled_lookup"`
+		ScheduledLookupPTR *bool   `json:"scheduled_lookup_ptr"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -790,6 +880,14 @@ func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
 		args = append(args, boolToInt(*body.IsInbox))
 		cacheAffecting = true
 	}
+	if body.ScheduledLookup != nil {
+		updates = append(updates, "scheduled_lookup = ?")
+		args = append(args, boolToInt(*body.ScheduledLookup))
+	}
+	if body.ScheduledLookupPTR != nil {
+		updates = append(updates, "scheduled_lookup_ptr = ?")
+		args = append(args, boolToInt(*body.ScheduledLookupPTR))
+	}
 	if len(updates) == 0 && !setHome && !setSrc {
 		apiError(w, http.StatusBadRequest, "invalid_request", "no editable fields supplied")
 		return
@@ -814,6 +912,20 @@ func (h *Handler) patchImage(w http.ResponseWriter, r *http.Request) {
 			}
 			apiError(w, http.StatusInternalServerError, "internal_error", err.Error())
 			return
+		}
+	}
+	// Turning the schedule back on is itself a reset: on an exhausted image
+	// a spent ladder would otherwise mean nothing happens, exactly as the
+	// detail page's [look again] avoids.
+	for backend, want := range map[string]*bool{
+		lookup.BackendBooru: body.ScheduledLookup,
+		lookup.BackendPTR:   body.ScheduledLookupPTR,
+	} {
+		if want == nil || !*want {
+			continue
+		}
+		if err := lookup.Reset(g.DB, id, backend, time.Now()); err != nil {
+			logx.Warnf("api: lookup reset for image %d: %v", id, err)
 		}
 	}
 	// source, collection, favorite, and inbox all feed cached aggregates
@@ -1159,7 +1271,7 @@ func (h *Handler) createImage(w http.ResponseWriter, r *http.Request) {
 				logx.Warnf("api createImage remove duplicate upload %q: %v", in.imgPath, rmErr)
 			}
 		}
-		sum, tagWarnings, mergeErr := h.mergeSource(g, img.ID, in.source, in.postID, in.url, in.md5, in.parentURL, in.initialTags)
+		sum, tagWarnings, mergeErr := mergeSource(g, img.ID, in.source, in.postID, in.url, in.md5, in.parentURL, in.initialTags)
 		if mergeErr != nil {
 			logx.Warnf("api createImage merge: %v", mergeErr)
 			apiError(w, http.StatusInternalServerError, "internal_error", "duplicate detected but the merge failed: "+mergeErr.Error())
@@ -1624,7 +1736,7 @@ func (h *Handler) applyInitialTags(g Gallery, imgID int64, rawTags []string, via
 	// than looking like anonymous UI adds. A caller-supplied via still
 	// wins and is recorded verbatim.
 	via = cmp.Or(via, "api")
-	tagIDs, warnings := h.resolveTagNames(g, rawTags, via)
+	tagIDs, warnings := resolveTagNames(g, rawTags, via)
 	if len(tagIDs) > 0 {
 		if _, err := g.TagSvc.AddTagsToOneImage(imgID, tagIDs, via); err != nil {
 			warnings = append(warnings, "apply tags: "+err.Error())
@@ -1637,11 +1749,11 @@ func (h *Handler) applyInitialTags(g Gallery, imgID int64, rawTags []string, via
 // creating missing rows stamped with origin (the pushing site or the
 // caller's via). Per-token failures land in warnings without aborting
 // the batch.
-func (h *Handler) resolveTagNames(g Gallery, rawTags []string, origin string) ([]int64, []string) {
+func resolveTagNames(g Gallery, rawTags []string, origin string) ([]int64, []string) {
 	var warnings []string
 	tagIDs := make([]int64, 0, len(rawTags))
 	for _, tagName := range rawTags {
-		catID, bareName, err := h.resolveCategoryTag(g, tagName)
+		catID, bareName, err := resolveCategoryTag(g, tagName)
 		if err != nil {
 			warnings = append(warnings, "tag "+tagName+": "+err.Error())
 			continue
@@ -1660,7 +1772,7 @@ func (h *Handler) resolveTagNames(g Gallery, rawTags []string, origin string) ([
 // "artist" names a real category, otherwise returns (general_id, input)
 // so colon-bearing tag names like "nier:automata" or ":3" round-trip
 // without a warning.
-func (h *Handler) resolveCategoryTag(g Gallery, input string) (int64, string, error) {
+func resolveCategoryTag(g Gallery, input string) (int64, string, error) {
 	input = strings.TrimSpace(input)
 	catName := "general"
 	tagName := input

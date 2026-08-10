@@ -94,7 +94,7 @@ func (s *Server) AddGallery(name, galleryPath string) error {
 		s.ctxMu.Unlock()
 		return fmt.Errorf("gallery %q already exists", name)
 	}
-	dbPath, thumbnailsPath := s.cfg.DerivePaths(name)
+	dbPath, thumbnailsPath := s.derivePaths(name)
 	if _, err := os.Stat(dbPath); err == nil {
 		s.ctxMu.Unlock()
 		return fmt.Errorf("data for gallery %q already exists at %q", name, filepath.Dir(dbPath))
@@ -114,7 +114,8 @@ func (s *Server) AddGallery(name, galleryPath string) error {
 	s.cfgMu.Lock()
 	s.cfg.Galleries = append(s.cfg.Galleries, g)
 	s.cfgMu.Unlock()
-	cx.startWatcher(s.cfg.Gallery.WatchEnabled, s.cfg.Gallery.MaxFileSizeMB, s.jobs)
+	watch, maxMB := s.watcherSettings()
+	cx.startWatcher(watch, maxMB, s.jobs)
 	s.ctxMu.Unlock()
 
 	if err := s.saveConfig(); err != nil {
@@ -141,7 +142,7 @@ func (s *Server) RemoveGallery(name string, removeFolder bool) error {
 		s.ctxMu.Unlock()
 		return fmt.Errorf("cannot remove the active gallery; switch to another first")
 	}
-	if name == s.cfg.DefaultGallery {
+	if name == s.defaultGallery() {
 		s.ctxMu.Unlock()
 		return fmt.Errorf("cannot remove the default gallery; set another as default first")
 	}
@@ -209,7 +210,7 @@ func (s *Server) RenameGallery(oldName, newName string) error {
 		s.ctxMu.Unlock()
 		return fmt.Errorf("gallery %q already exists", newName)
 	}
-	newDB, newThumbs := s.cfg.DerivePaths(newName)
+	newDB, newThumbs := s.derivePaths(newName)
 	newDir := filepath.Dir(newDB)
 	if _, err := os.Stat(newDir); err == nil {
 		s.ctxMu.Unlock()
@@ -252,7 +253,8 @@ func (s *Server) RenameGallery(oldName, newName string) error {
 	if s.activeName == oldName {
 		s.activeName = newName
 	}
-	newCx.startWatcher(s.cfg.Gallery.WatchEnabled, s.cfg.Gallery.MaxFileSizeMB, s.jobs)
+	watch, maxMB := s.watcherSettings()
+	newCx.startWatcher(watch, maxMB, s.jobs)
 	s.ctxMu.Unlock()
 
 	if err := s.saveConfig(); err != nil {

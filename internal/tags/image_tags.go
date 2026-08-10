@@ -612,6 +612,79 @@ func (s *Service) RemoveSourceTagsFromImage(imageID int64, sources []string, sta
 	return s.removeMatchingTx(imageID, where, args...)
 }
 
+// RemoveCategoryTagsFromImage drops the image's own tags in one category.
+// Implied rows are left to the closure walk: they belong to whatever
+// parent justifies them, which may sit in another category.
+func (s *Service) RemoveCategoryTagsFromImage(imageID int64, category string) (int, error) {
+	return s.removeMatchingTx(imageID,
+		`AND is_implied = 0 AND tag_id IN (
+		   SELECT t.id FROM tags t
+		   JOIN tag_categories tc ON tc.id = t.category_id
+		   WHERE tc.name = ?)`, category)
+}
+
+// DropSourceFromImageTags withdraws one source's claim on an image's
+// tags. Its ledger rows go; a tag no other source still vouches for
+// leaves the image with them, while one another source also applied
+// stays and merely stops being listed under this source. A non-empty
+// tagIDs narrows the withdrawal to those tags.
+//
+// This is deliberately not RemoveSourceTagsFromImage, which deletes by
+// first-writer attribution: a tag two sources agree on belongs to both,
+// so one of them backing out cannot take it off the image.
+//
+// Returns how many tags the source was recorded against and how many of
+// them left the image.
+func (s *Service) DropSourceFromImageTags(imageID int64, source string, tagIDs []int64) (covered, removed int, err error) {
+	err = s.inWriteTx(func(tx *sql.Tx) error {
+		// The ledger rows, plus the rows no ledger ever recorded whose own
+		// attribution names this source - the fallback the by-source view
+		// lists them under, so the withdrawal has to reach them too.
+		claim := `SELECT tag_id FROM (
+		            SELECT tag_id FROM image_tag_sources
+		             WHERE image_id = ? AND source = ?
+		            UNION
+		            SELECT it.tag_id FROM image_tags it
+		             WHERE it.image_id = ? AND it.is_implied = 0
+		               AND COALESCE(NULLIF(it.tagger_name, ''), 'user') = ?
+		               AND NOT EXISTS (SELECT 1 FROM image_tag_sources s
+		                                WHERE s.image_id = it.image_id AND s.tag_id = it.tag_id))`
+		args := []any{imageID, source, imageID, source}
+		if len(tagIDs) > 0 {
+			placeholders, ids := db.InPlaceholders(tagIDs)
+			claim += ` WHERE tag_id IN (` + placeholders + `)`
+			args = append(args, ids...)
+		}
+		claimed, err := db.QueryIDs(tx, claim, args...)
+		if err != nil {
+			return err
+		}
+		covered = len(claimed)
+		if covered == 0 {
+			return nil
+		}
+		placeholders, ids := db.InPlaceholders(claimed)
+		if _, err := tx.Exec(
+			`DELETE FROM image_tag_sources
+			  WHERE image_id = ? AND source = ? AND tag_id IN (`+placeholders+`)`,
+			append([]any{imageID, source}, ids...)...); err != nil {
+			return err
+		}
+		orphaned, err := db.QueryIDs(tx,
+			`SELECT it.tag_id FROM image_tags it
+			  WHERE it.image_id = ? AND it.is_implied = 0 AND it.tag_id IN (`+placeholders+`)
+			    AND NOT EXISTS (SELECT 1 FROM image_tag_sources s
+			                     WHERE s.image_id = it.image_id AND s.tag_id = it.tag_id)`,
+			append([]any{imageID}, ids...)...)
+		if err != nil {
+			return err
+		}
+		removed, err = removeTagIDsFromImageTx(tx, imageID, orphaned)
+		return err
+	})
+	return covered, removed, err
+}
+
 // RemoveAutoTagsFromImage drops auto-tagged image_tags rows for one
 // image. A non-empty taggerNames restricts the deletion to rows whose
 // tagger_name matches.

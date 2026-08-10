@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/monbooru/monbooru/internal/config"
 	"github.com/monbooru/monbooru/internal/gallery"
 	"github.com/monbooru/monbooru/internal/logx"
 	"github.com/monbooru/monbooru/internal/models"
@@ -75,6 +76,9 @@ type galleryData struct {
 	// out-of-band swap, which the HTMX fragment needs and the full-page
 	// render must not carry.
 	SortSelectOOB bool
+	// PluginSlot is the batch-bar mount point: the peers' relay buttons for
+	// the current selection, absent when no peer offers any.
+	PluginSlot pluginSlotView
 }
 
 // inboxCluster describes one batch of time-adjacent inbox entries
@@ -180,13 +184,14 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 	ceiling := resolveCeiling(r, s.Active())
 	pinnedCollection := search.PinnedCollectionName(expr)
 	expr = ceiling.Apply(expr)
+	pageSize := s.pageSize()
 	sq := search.Query{
 		Expr:       expr,
 		Sort:       sortStr,
 		Order:      orderStr,
 		RandomSeed: randomSeed,
 		Page:       page,
-		Limit:      s.cfg.UI.PageSize,
+		Limit:      pageSize,
 		CacheKey:   search.BuildAdjacencyCacheKey(s.activeName, queryStr, sortStr, orderStr, randomSeed, ceiling.Level()),
 	}
 	if sortStr == "order" {
@@ -216,8 +221,8 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 	firstElapsed := time.Since(firstStart)
 
 	totalPages := 1
-	if s.cfg.UI.PageSize > 0 {
-		totalPages = (result.Total + s.cfg.UI.PageSize - 1) / s.cfg.UI.PageSize
+	if pageSize > 0 {
+		totalPages = (result.Total + pageSize - 1) / pageSize
 	}
 
 	// If a concurrent ingestion or delete shrank the result set out from under
@@ -311,7 +316,7 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 		SearchWarning:     searchWarning(expr),
 		Sort:              sortStr,
 		Order:             orderStr,
-		ThumbnailFit:      s.cfg.UI.ThumbnailFit,
+		ThumbnailFit:      s.thumbnailFit(),
 		RandomSeed:        randomSeed,
 		Page:              page,
 		TotalPages:        totalPages,
@@ -320,7 +325,8 @@ func (s *Server) galleryHandler(w http.ResponseWriter, r *http.Request) {
 		FolderTree:        sb.Folders,
 		SourceLabelCounts: sb.SourceLabels,
 		SavedSearches:     sb.Saved,
-		EnabledTaggers:    tagger.EnabledTaggersForGallery(s.cfg, s.activeName),
+		EnabledTaggers:    tagger.EnabledTaggersForGallery(s.cfgSnapshot(), s.activeName),
+		PluginSlot:        s.pluginSlot(r, config.SlotBatchBar, 0, ""),
 		ActiveTagTerms:    computeActiveTagTerms(queryStr),
 	}
 	// A similar: query ranks by a number the grid otherwise never shows;
@@ -476,7 +482,7 @@ func (s *Server) gallerySidebar(w http.ResponseWriter, r *http.Request) {
 			Order:      orderStr,
 			RandomSeed: randomSeed,
 			Page:       page,
-			Limit:      s.cfg.UI.PageSize,
+			Limit:      s.pageSize(),
 			SkipCount:  true,
 		}
 		result, err := search.Execute(s.db(), sq)

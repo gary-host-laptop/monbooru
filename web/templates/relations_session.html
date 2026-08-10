@@ -39,7 +39,7 @@
           hx-on::after-request="if(event.detail.successful){window.location.reload()}"
           style="display:inline">
       <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
-      <button type="submit" class="btn-sm btn-purple">Raise ceiling to explicit</button>
+      <button type="submit" class="btn-sm btn-success">Raise ceiling to explicit</button>
     </form>
     {{else if gt .Skipped 0}}
     <h3>Nothing left to review.</h3>
@@ -307,8 +307,8 @@
   function mountMedia(slot, id, fileType) {
     if (!slot) return;
     while (slot.firstChild) slot.removeChild(slot.firstChild);
-    var src = '/images/' + id + '/file';
     var isVideo = fileType === 'mp4' || fileType === 'webm';
+    var src = '/images/' + id + (isVideo ? '/file' : '/view');
     var el = document.createElement(isVideo ? 'video' : 'img');
     if (isVideo) {
       el.autoplay = true;

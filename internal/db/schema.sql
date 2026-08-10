@@ -105,12 +105,16 @@ CREATE TABLE IF NOT EXISTS image_paths (
     image_id     INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
     path         TEXT    NOT NULL UNIQUE,
     is_canonical INTEGER NOT NULL DEFAULT 0,
-    -- File mtime (Unix seconds) at the time the row was last touched.
-    -- Sync's unchanged-shortcut requires (size, mtime) parity so a
-    -- same-size in-place edit is still re-hashed. 0 marks rows that
-    -- predate this column on upgraded libraries; sync re-hashes them
-    -- once and writes the real mtime back.
-    mtime_unix   INTEGER NOT NULL DEFAULT 0
+    -- File mtime at the time the row was last touched, in Unix seconds and
+    -- again as Unix nanoseconds. Sync's unchanged-shortcut requires (size,
+    -- mtime) parity so a same-size in-place edit is still re-hashed, and it
+    -- reads mtime_nsec when the row has one: whole seconds cannot tell an
+    -- edit that landed in the same second the file was last observed. 0
+    -- marks rows that predate each column on upgraded libraries - a row
+    -- with no nsec keeps the second-grained comparison rather than costing
+    -- the library a full re-hash on upgrade.
+    mtime_unix   INTEGER NOT NULL DEFAULT 0,
+    mtime_nsec   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS image_tags (
@@ -367,6 +371,29 @@ CREATE TABLE IF NOT EXISTS folded_tag_pairs (
     PRIMARY KEY (old_id, new_id)
 );
 
+-- One row per (image, lookup backend), written the moment an attempt is
+-- enqueued: an image nobody ever looked up costs no row. attempts counts
+-- consecutive concluded misses and drives the retry ladder; queued_at
+-- non-NULL is the in-flight state (there is no pending literal to leak into
+-- last_result) and job_id is monloader's id for it, which is what makes an
+-- attempt whose callback went missing reconcilable at all. next_due_at NULL
+-- means nothing is scheduled, for one of three reasons last_result and
+-- images.scheduled_lookup tell apart: a hit, an exhausted ladder, or the
+-- operator's opt-out. ptr_cursor is monloader's index position at the miss,
+-- so a PTR retry can skip an index that has not moved.
+CREATE TABLE IF NOT EXISTS image_lookups (
+    image_id    INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    backend     TEXT    NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    queued_at   TEXT,
+    job_id      INTEGER,
+    last_at     TEXT,
+    last_result TEXT    NOT NULL DEFAULT '',
+    next_due_at TEXT,
+    ptr_cursor  INTEGER,
+    PRIMARY KEY (image_id, backend)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_tags_name         ON tags(name);
 CREATE INDEX IF NOT EXISTS idx_tags_category     ON tags(category_id);
@@ -447,3 +474,7 @@ CREATE INDEX IF NOT EXISTS idx_potential_pairs_distance ON potential_relation_pa
 -- b-side seek for the collection_hidden resweep triggers; the a side
 -- rides the primary key prefix.
 CREATE INDEX IF NOT EXISTS idx_potential_pairs_b        ON potential_relation_pairs(b_image_id);
+CREATE INDEX IF NOT EXISTS idx_image_lookups_due        ON image_lookups(backend, next_due_at);
+-- The partial in-flight index is what keeps the reconcile sweep proportional
+-- to the handful of rows actually waiting rather than to the table.
+CREATE INDEX IF NOT EXISTS idx_image_lookups_inflight   ON image_lookups(queued_at) WHERE queued_at IS NOT NULL;

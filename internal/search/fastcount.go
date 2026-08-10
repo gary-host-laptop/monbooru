@@ -15,8 +15,9 @@ import (
 //
 // Recognised shapes (each delegates to a fastCount* helper):
 //   - TagExpr literal, no wildcard, single canonical - exact.
-//   - TagExpr wildcard - sum over canonicals; upper bound when an image
-//     carries more than one matching tag.
+//   - TagExpr wildcard - sum over canonicals capped at the visible
+//     count; upper bound when an image carries more than one matching
+//     tag.
 //   - NotExpr{TagExpr literal, no wildcard} - exact.
 //   - AndExpr/OrExpr of recognised sub-shapes - min/sum, both upper bounds.
 //   - FilterExpr{cat:X} - sum over category; upper bound.
@@ -205,14 +206,15 @@ func peelCeilingChain(expr Expr, out *[]string) Expr {
 // large libraries) the upper-bound short-circuit kicks in.
 const fastApproxThreshold = 50000
 
-// rankInQueryCountSkip caps the matched-set size RankInQuery will
-// run a COUNT against. Popular tags (>50 k carriers) walk newer-than-
-// currentID rows in numbers that peg the detail handler's 500 ms ctx
-// ceiling even with the AND-driver inline. Below the cap the cursor
-// terminates inside the budget; above it the helper short-circuits
-// to -1 so the detail page degrades to the URL's back_page without
-// blocking the render.
-const rankInQueryCountSkip = 50000
+// rankInQueryMaxRank caps how far down its result set RankInQuery will
+// count. What makes a rank expensive is how deep the image sits, not
+// how many rows the query matches, and prev/next only ever walks a page
+// or two past wherever the operator arrived - five default pages of head
+// room covers that and keeps the count off the detail handler's 500 ms
+// ceiling. Deeper than the cap the helper reports -1: the page it would
+// name is the one the URL already carries, since nothing but a click on
+// that page could have got the operator there.
+const rankInQueryMaxRank = 200
 
 func fastCountTag(database *db.DB, t TagExpr) (int, bool) {
 	if t.Tag == "" {
@@ -258,7 +260,11 @@ func fastCountTag(database *db.DB, t TagExpr) (int, bool) {
 	if n < fastApproxThreshold {
 		return 0, false
 	}
-	return n, true
+	// The sum counts an image once per matching tag it carries, so a
+	// pattern that resolves to hundreds of canonicals can total several
+	// times the library. Clamp to the visible count like the OR bound:
+	// still loose, but never a number the gallery can't hold.
+	return capToVisible(database, n)
 }
 
 // fastCountNot only handles NOT of a single literal tag. count(!E) is
@@ -339,6 +345,33 @@ var fastCountFilters = map[string]func(*db.DB, FilterExpr) (int, bool){
 	"inbox":      fastCountInbox,
 	"ai":         fastCountAI,
 	"folder":     fastCountFolder,
+	"lookup":     fastCountLookup,
+}
+
+// fastCountLookup answers `lookup:never` - the images the hash-lookup
+// scheduler has no record for - as the visible count minus the visible
+// images that do carry one. The slow path evaluates a NOT EXISTS per
+// visible row, which is the whole library on a gallery that has never
+// run a lookup and matches every row it walks. The subtrahend costs one
+// pass over image_lookups instead, bounded by how many images have ever
+// been looked up. The other four values read recorded history and stay
+// on the slow path, where their own EXISTS is selective.
+func fastCountLookup(database *db.DB, e FilterExpr) (int, bool) {
+	if strings.ToLower(e.Val) != "never" {
+		return 0, false
+	}
+	visible, ok := fastVisibleCount(database)
+	if !ok {
+		return 0, false
+	}
+	var recorded int
+	if err := database.Read.QueryRow(
+		`SELECT COUNT(*) FROM (SELECT DISTINCT image_id FROM image_lookups) l
+		 JOIN images i ON i.id = l.image_id AND i.is_missing = 0`,
+	).Scan(&recorded); err != nil {
+		return 0, false
+	}
+	return max(visible-recorded, 0), true
 }
 
 // fastCountCat sums usage_count over non-alias tags in the category.

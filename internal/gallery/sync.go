@@ -12,6 +12,7 @@ import (
 
 	"github.com/monbooru/monbooru/internal/db"
 	"github.com/monbooru/monbooru/internal/logx"
+	"github.com/monbooru/monbooru/internal/lookup"
 	"github.com/monbooru/monbooru/internal/tags"
 )
 
@@ -50,19 +51,35 @@ func SourceLabelCountsQuery(database *db.DB, limit int) ([]SourceLabelCount, err
 // either taken from the (size+mtime)-unchanged shortcut or freshly
 // hashed during the walk.
 type syncFileInfo struct {
-	path   string
-	sha256 string
-	size   int64
-	mtime  int64
+	path      string
+	sha256    string
+	size      int64
+	mtime     int64
+	mtimeNano int64
 }
 
 // syncKnownEntry is one image_paths row preloaded for the unchanged-
 // shortcut. The Phase 1 walker keys on (size, mtime); a hit avoids the
 // re-hash on every untouched file.
 type syncKnownEntry struct {
-	size   int64
-	sha256 string
-	mtime  int64
+	size      int64
+	sha256    string
+	mtime     int64
+	mtimeNano int64
+}
+
+// unchanged reports whether the recorded stamp still describes the file.
+// The nanosecond one decides when the row carries it; a row written before
+// that column falls back to the second, which cannot tell an edit that
+// landed in the same second the file was last observed.
+func (k syncKnownEntry) unchanged(size, mtime, mtimeNano int64) bool {
+	if k.size != size {
+		return false
+	}
+	if k.mtimeNano != 0 {
+		return k.mtimeNano == mtimeNano
+	}
+	return k.mtime != 0 && k.mtime == mtime
 }
 
 // syncBySHARow is one images row preloaded for the reconcile lookup.
@@ -168,12 +185,13 @@ func Sync(ctx context.Context, database *db.DB, galleryPath, thumbnailsPath stri
 	return result, nil
 }
 
-// loadKnownPaths preloads (path, size, sha256, mtime_unix) for every
+// loadKnownPaths preloads (path, size, sha256, mtime) for every
 // image_paths row, used by the walker's unchanged-shortcut.
 func loadKnownPaths(database *db.DB) (map[string]syncKnownEntry, error) {
 	known := map[string]syncKnownEntry{}
 	rows, err := database.Read.Query(
-		`SELECT ip.path, i.file_size, i.sha256, ip.mtime_unix FROM image_paths ip JOIN images i ON i.id = ip.image_id`,
+		`SELECT ip.path, i.file_size, i.sha256, ip.mtime_unix, ip.mtime_nsec
+		   FROM image_paths ip JOIN images i ON i.id = ip.image_id`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("preloading known paths: %w", err)
@@ -181,11 +199,11 @@ func loadKnownPaths(database *db.DB) (map[string]syncKnownEntry, error) {
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var p, sha string
-		var sz, mt int64
-		if err := rows.Scan(&p, &sz, &sha, &mt); err != nil {
+		var sz, mt, mtNano int64
+		if err := rows.Scan(&p, &sz, &sha, &mt, &mtNano); err != nil {
 			return nil, fmt.Errorf("scanning known paths: %w", err)
 		}
-		known[p] = syncKnownEntry{size: sz, sha256: sha, mtime: mt}
+		known[p] = syncKnownEntry{size: sz, sha256: sha, mtime: mt, mtimeNano: mtNano}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating known paths: %w", err)
@@ -219,12 +237,12 @@ func walkGalleryFiles(ctx context.Context, galleryPath string, maxBytes int64, k
 		if maxBytes > 0 && info.Size() > maxBytes {
 			return nil
 		}
-		mtimeUnix := info.ModTime().Unix()
+		mtimeUnix, mtimeNano := info.ModTime().Unix(), info.ModTime().UnixNano()
 		var hash string
-		if k, ok := known[path]; ok && k.size == info.Size() && k.mtime != 0 && k.mtime == mtimeUnix {
+		if k, ok := known[path]; ok && k.unchanged(info.Size(), mtimeUnix, mtimeNano) {
 			// Same path, size, and mtime: assume unchanged content. The
 			// mtime gate catches the same-size in-place edit case the
-			// size-only check missed; rows that predate the mtime column
+			// size-only check missed; rows that predate the mtime columns
 			// (mtime=0) re-hash once and persist the real mtime back.
 			hash = k.sha256
 		} else {
@@ -238,7 +256,7 @@ func walkGalleryFiles(ctx context.Context, galleryPath string, maxBytes int64, k
 			// were already claimed by a previous sync.
 			ClaimOwnership(path)
 		}
-		found = append(found, syncFileInfo{path: path, sha256: hash, size: info.Size(), mtime: mtimeUnix})
+		found = append(found, syncFileInfo{path: path, sha256: hash, size: info.Size(), mtime: mtimeUnix, mtimeNano: mtimeNano})
 		return nil
 	})
 	if err != nil {
@@ -286,7 +304,7 @@ func reconcileFile(database *db.DB, galleryPath, thumbnailsPath string, fi syncF
 	// a re-hash; apply the new SHA / size / dimensions / metadata to
 	// the existing image row so tags survive the rewrite.
 	if k, knownPath := known[fi.path]; knownPath && k.sha256 != fi.sha256 {
-		if err := applyInPlaceEdit(database, thumbnailsPath, fi.path, fi.sha256, fi.mtime, fi.size); err != nil {
+		if err := applyInPlaceEdit(database, thumbnailsPath, fi.path, fi.sha256, fi.mtime, fi.mtimeNano, fi.size); err != nil {
 			logx.Warnf("sync: in-place edit %q: %v", fi.path, err)
 			return
 		}
@@ -334,7 +352,7 @@ func reconcileExistingSHA(database *db.DB, galleryPath string, fi syncFileInfo, 
 	// Persist the freshly-observed mtime on the touched row so the next
 	// sync's unchanged-shortcut can fire.
 	if _, wErr := database.Write.Exec(
-		`UPDATE image_paths SET mtime_unix = ? WHERE path = ?`, fi.mtime, fi.path,
+		`UPDATE image_paths SET mtime_unix = ?, mtime_nsec = ? WHERE path = ?`, fi.mtime, fi.mtimeNano, fi.path,
 	); wErr != nil {
 		logx.Warnf("sync: persist mtime for %q: %v", fi.path, wErr)
 	}
@@ -370,8 +388,8 @@ func reconcileExistingSHA(database *db.DB, galleryPath string, fi syncFileInfo, 
 		return
 	}
 	if _, wErr := database.Write.Exec(
-		`INSERT OR IGNORE INTO image_paths (image_id, path, is_canonical, mtime_unix) VALUES (?, ?, 0, ?)`,
-		row.id, fi.path, fi.mtime,
+		`INSERT OR IGNORE INTO image_paths (image_id, path, is_canonical, mtime_unix, mtime_nsec) VALUES (?, ?, 0, ?, ?)`,
+		row.id, fi.path, fi.mtime, fi.mtimeNano,
 	); wErr != nil {
 		logx.Warnf("sync: insert alias path %d: %v", row.id, wErr)
 	}
@@ -555,7 +573,7 @@ func pruneStaleAliasPaths(ctx context.Context, database *db.DB, foundPaths map[s
 // on disk, and the thumbnail is regenerated. The mtime gate at the top
 // of the walk is what triggers entry; the corresponding image_paths
 // row's mtime is updated here so the next sync's shortcut can fire.
-func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA string, newMtime, newSize int64) error {
+func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA string, newMtime, newMtimeNano, newSize int64) error {
 	var imageID int64
 	if err := database.Read.QueryRow(
 		`SELECT image_id FROM image_paths WHERE path = ?`, path,
@@ -605,9 +623,13 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA string, newM
 		return fmt.Errorf("update images row: %w", err)
 	}
 	if _, err := tx.Exec(
-		`UPDATE image_paths SET mtime_unix = ? WHERE path = ?`, newMtime, path,
+		`UPDATE image_paths SET mtime_unix = ?, mtime_nsec = ? WHERE path = ?`, newMtime, newMtimeNano, path,
 	); err != nil {
 		return fmt.Errorf("update image_paths mtime: %w", err)
+	}
+	// The recorded lookup misses are about bytes this row no longer has.
+	if err := lookup.DeleteForImage(tx, imageID); err != nil {
+		return fmt.Errorf("clear lookup history: %w", err)
 	}
 	// Replace the side-table metadata rather than keeping rows the old
 	// bytes carried: an edit can add a recipe, change it, or strip it.
@@ -648,7 +670,7 @@ func applyInPlaceEdit(database *db.DB, thumbnailsPath, path, newSHA string, newM
 	} else if err := RecomputeAndStorePhash(context.Background(), database, imageID, thumbnailsPath); err != nil {
 		logx.Warnf("in-place edit: phash recompute for %q: %v", path, err)
 	}
-	logx.Infof("sync: applied in-place edit to image id=%d at %q (sha %s)", imageID, path, newSHA)
+	logx.Infof("in-place edit: image id=%d at %q now carries sha %s", imageID, path, newSHA)
 	return nil
 }
 

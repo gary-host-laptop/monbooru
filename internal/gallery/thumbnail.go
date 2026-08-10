@@ -22,6 +22,62 @@ import (
 const thumbMaxDim = 300
 const thumbQuality = 85
 
+// viewMaxPixels is the size past which the detail view stops handing the
+// browser the original file, and ViewMaxDim the longest side of the
+// rendition it hands over instead. Browsers cap a decoded bitmap at 2 GiB,
+// which at four bytes a pixel is 2^29 pixels, and past that they refuse the
+// decode outright - so an image above the cap is undisplayable everywhere
+// with only a 300 px thumbnail between it and the file. The ceiling is a
+// round number well under that measured limit rather than the limit itself,
+// so it survives an engine stricter than Chromium and leaves every real
+// photo and scan on its full-resolution file.
+const (
+	viewMaxPixels = 100_000_000
+	ViewMaxDim    = 4000
+)
+
+// ViewRenditionPath is where an image's bounded display rendition is cached,
+// beside its thumbnail.
+func ViewRenditionPath(dir string, imageID int64) string {
+	return filepath.Join(dir, fmt.Sprintf("%d_view.jpg", imageID))
+}
+
+// NeedsViewRendition reports whether an image's stored geometry is past the
+// ceiling, so the caller serves the rendition rather than the file. Zero
+// dimensions (a header nothing could read) answer false: without a size
+// there is nothing to decide on, and the original is what every other
+// unmeasurable file gets.
+func NeedsViewRendition(width, height int) bool {
+	return int64(width)*int64(height) > viewMaxPixels
+}
+
+// EnsureViewRendition returns the cached rendition's path, generating it
+// from the original on first use. Lazy because only the rare oversized image
+// needs one at all: producing it at ingest would write a second file per
+// image for a ceiling almost nothing reaches.
+func EnsureViewRendition(srcPath, dstDir string, imageID int64) (string, error) {
+	dst := ViewRenditionPath(dstDir, imageID)
+	if _, err := os.Stat(dst); err == nil {
+		return dst, nil
+	}
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		return "", fmt.Errorf("create rendition dir: %w", err)
+	}
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	src, err := DecodeImageWithCap(f)
+	if err != nil {
+		return "", fmt.Errorf("decoding image: %w", err)
+	}
+	if err := writeJPEGAtomic(scaleImage(src, ViewMaxDim), dst, thumbQuality); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
 // maxImageBytes caps the destination bitmap the decode path is willing
 // to allocate, so a header claiming 50000x50000 truecolor is refused
 // instead of demanding 10 GiB and OOM-killing the process at ingest or
@@ -113,6 +169,10 @@ func Generate(srcPath, dstDir string, imageID int64, fileType string) error {
 	if err := os.MkdirAll(dstDir, 0755); err != nil {
 		return fmt.Errorf("creating thumbnail dir: %w", err)
 	}
+	// Both renditions come off the same bytes, so anything that rewrites the
+	// thumbnail - a replace, a re-ingest, a rebuild - leaves the display
+	// rendition showing the picture the file no longer holds.
+	_ = os.Remove(ViewRenditionPath(dstDir, imageID))
 
 	dstPath := ThumbnailPath(dstDir, imageID)
 

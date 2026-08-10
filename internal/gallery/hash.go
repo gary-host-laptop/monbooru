@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"mime"
 	"os"
 	"path/filepath"
 	"strings"
@@ -284,4 +285,12 @@ func MIMEForFileType(fileType string) string {
 		return "application/zip"
 	}
 	return ""
+}
+
+// ContentDispositionFor names a download after the file on disk. The byte
+// routes end in an extensionless segment, so a browser left to itself names
+// the download from the Content-Type, which cannot tell a .cbz from a .zip;
+// inline keeps the same URL usable as an <img>/<video> src.
+func ContentDispositionFor(canonPath string) string {
+	return mime.FormatMediaType("inline", map[string]string{"filename": filepath.Base(canonPath)})
 }

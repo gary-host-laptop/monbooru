@@ -15,8 +15,8 @@
     <tbody id="cat-list">
       {{range index . "Categories"}}
       <tr id="cat-row-{{.ID}}">
-        <td><span style="color:{{.Color}}">{{.Name}}</span>{{if .IsBuiltin}} <span class="field-hint">(built-in)</span>{{end}}</td>
-        <td><span style="color:{{.Color}}" class="mono-small">{{.Color}}</span></td>
+        <td><span style="color:{{catColor .Color}}">{{.Name}}</span>{{if .IsBuiltin}} <span class="field-hint">(built-in)</span>{{end}}</td>
+        <td><span style="color:{{catColor .Color}}" class="mono-small">{{.Color}}</span></td>
         <td>
           <div class="cat-actions">
             <button class="btn-sm btn-cat-recolor-trigger"
@@ -95,7 +95,7 @@
       <label>Move tags to category:</label>
       <select id="del-cat-target">
         {{range index . "Categories"}}
-        <option value="{{.ID}}">{{.Name}}</option>
+        <option value="{{.ID}}"{{if eq .Name "rating"}} data-locked="1"{{end}}>{{.Name}}</option>
         {{end}}
       </select>
     </div>
@@ -155,7 +155,7 @@ document.querySelectorAll('.btn-delete-category').forEach(function(btn) {
 
         var targetSel = document.getElementById('del-cat-target');
         Array.from(targetSel.options).forEach(function(opt) {
-          opt.disabled = (opt.value == catId);
+          opt.disabled = (opt.value == catId) || opt.dataset.locked === '1';
           opt.hidden = opt.disabled;
           if (opt.disabled && targetSel.value == catId) {
             var first = Array.from(targetSel.options).find(function(o) { return !o.disabled; });

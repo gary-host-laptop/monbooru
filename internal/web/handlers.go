@@ -199,12 +199,17 @@ func loadImagePaths(ctx context.Context, database *db.DB, id int64) []models.Ima
 	return paths
 }
 
+// defaultThemeColor mirrors the stylesheet's --bg, the splash a viewer
+// gets when server.theme_color is unset.
+const defaultThemeColor = "#0e0e0e"
+
 // manifestHandler serves the web app manifest behind the layout's
 // <link rel="manifest">, so a browser can install the gallery as a
 // home-screen app. The icon follows server.logo the same way
 // booruFaviconURL does - an override replaces the bundled icon rather
-// than sitting beside it - and carries no sizes hint, since the
-// operator's file has whatever dimensions it has.
+// than sitting beside it, and an active theme's logo.png does not reach
+// it - and carries no sizes hint, since the operator's file has
+// whatever dimensions it has.
 func (s *Server) manifestHandler(w http.ResponseWriter, r *http.Request) {
 	icon := map[string]any{
 		"src":     "/static/icon-192.png",
@@ -212,10 +217,11 @@ func (s *Server) manifestHandler(w http.ResponseWriter, r *http.Request) {
 		"type":    "image/png",
 		"purpose": "any maskable",
 	}
-	if s.cfg.Server.BooruLogo != "" {
-		icon = map[string]any{"src": "/custom.logo"}
+	if logo := s.customLogoURL(); logo != "" {
+		icon = map[string]any{"src": logo}
 	}
 	name := s.booruName()
+	color := cmp.Or(s.themeColor(), defaultThemeColor)
 	w.Header().Set("Content-Type", "application/manifest+json; charset=utf-8")
 	// Built from live config, so a heuristic cache would keep serving the
 	// old name after a rename; /custom.css and /custom.logo revalidate for
@@ -227,8 +233,8 @@ func (s *Server) manifestHandler(w http.ResponseWriter, r *http.Request) {
 		"id":               "/",
 		"start_url":        "/",
 		"display":          "standalone",
-		"background_color": "#0e0e0e",
-		"theme_color":      "#0e0e0e",
+		"background_color": color,
+		"theme_color":      color,
 		"icons":            []map[string]any{icon},
 	})
 }

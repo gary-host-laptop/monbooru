@@ -206,15 +206,6 @@ function navDetailArrow(direction, noun) {
   return false;
 }
 
-// Reveal or hide a source group's cross-attributed tags (ones this source
-// also applied but that list under another group).
-function toggleSourceExtra(header) {
-  var extra = header.parentElement.querySelector('.tag-source-extra');
-  if (!extra) return;
-  extra.hidden = !extra.hidden;
-  header.classList.toggle('tag-source-open', !extra.hidden);
-}
-
 // Remove a relation row and, when it empties its origin subgroup, drop the
 // now-empty list and its "added by" subheading too.
 function pruneRelationRow(btn) {
@@ -680,8 +671,7 @@ document.addEventListener('keydown', function(e) {
       clearSelection();
       return;
     }
-    if (document.body.classList.contains('tag-focus') ||
-        document.querySelector('#image-tags .tag-item.focused')) {
+    if (document.body.classList.contains('tag-focus') || focusedTagRow()) {
       e.preventDefault();
       exitTagFocusMode();
       return;
@@ -829,7 +819,7 @@ document.addEventListener('keydown', function(e) {
 
   // Settings page: 1-9 jump to section anchors, in nav order.
   if (isSettingsPage() && /^[1-9]$/.test(e.key)) {
-    var settingsAnchors = ['#general', '#galleries', '#monloader', '#tagger', '#relations', '#auth', '#maintenance', '#schedule', '#stats'];
+    var settingsAnchors = ['#general', '#galleries', '#plugins', '#tagger', '#relations', '#auth', '#maintenance', '#schedule', '#stats'];
     var sec = document.querySelector(settingsAnchors[parseInt(e.key, 10) - 1]);
     if (sec) { e.preventDefault(); sec.scrollIntoView({ behavior: 'smooth', block: 'start' }); return; }
   }
@@ -1024,7 +1014,7 @@ document.addEventListener('keydown', function(e) {
   // Detail page: h/k = prev image, l/j = next image.
   // Gallery: grid-cursor moves (h ← l → k ↑ j ↓).
   if (e.key === 'h' || e.key === 'l' || e.key === 'j' || e.key === 'k') {
-    if (document.querySelector('#image-tags .tag-item.focused')) {
+    if (focusedTagRow()) {
       e.preventDefault();
       cycleTagFocus((e.key === 'l' || e.key === 'j') ? 1 : -1);
       return;
@@ -1047,7 +1037,7 @@ document.addEventListener('keydown', function(e) {
 
   // Arrow keys: tag-focus mode > detail prev/next > gallery grid moves.
   if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-    if (document.querySelector('#image-tags .tag-item.focused')) {
+    if (focusedTagRow()) {
       e.preventDefault();
       cycleTagFocus(e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : -1);
       return;
@@ -1074,17 +1064,16 @@ document.addEventListener('keydown', function(e) {
 
   // Enter: tag-focus mode remove > gallery open focused card.
   if (e.key === 'Enter') {
-    var focusedTag = document.querySelector('#image-tags .tag-item.focused');
+    var focusedTag = focusedTagRow();
     if (focusedTag) {
       e.preventDefault();
       // Stash the focused tag's flat-list index so the htmx:afterSettle
       // swap below can land the cursor on the previous sibling instead
       // of dropping back to index 0 (the natural restart point with no
       // .focused element to anchor to).
-      var allTags = Array.from(document.querySelectorAll('#image-tags .tag-item'));
-      var idx = allTags.indexOf(focusedTag);
+      var idx = tagFocusRows().indexOf(focusedTag);
       if (idx >= 0) document.body.dataset.tagFocusIdx = String(idx);
-      var tagBtn = focusedTag.querySelector('.tag-remove-btn');
+      var tagBtn = focusedTag.querySelector('.tag-entry-remove');
       if (tagBtn) tagBtn.click();
       return;
     }
@@ -1579,8 +1568,10 @@ function updateClusterButtons() {
 function updateBatchBar() {
   const checked = document.querySelectorAll('.thumb-checkbox:checked');
   const bar = document.getElementById('batch-bar');
+  const pluginBar = document.getElementById('plugin-batch-bar');
   const grid = document.getElementById('gallery-grid');
   if (bar) bar.classList.toggle('visible', checked.length > 0);
+  if (pluginBar) pluginBar.classList.toggle('visible', checked.length > 0);
   if (grid) grid.classList.toggle('batch-active', checked.length > 0);
   const countEl = document.getElementById('batch-count');
   if (countEl) countEl.textContent = checked.length + ' selected';
@@ -1602,13 +1593,72 @@ function selectAll() {
   updateBatchBar();
 }
 
+// stashSelection carries the checked ids across the reload an action ends
+// in - a plugin relay answering refresh: true, or a batch job's completion.
+// The stash names the page it was made on and is consumed by the next load,
+// so one left behind by an action that never reloaded cannot re-select on
+// some other listing. The window is minutes rather than stashActionFlash's
+// seconds: a batch reloads when its background job finishes, which over a
+// few thousand images is a while after the click.
+var selectionStashMs = 300000;
+
+function stashSelection(ids) {
+  try {
+    sessionStorage.setItem('monbooru_selection', JSON.stringify(
+      {ids: ids, url: location.pathname + location.search, t: Date.now()}));
+  } catch (e) {}
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  var raw = null;
+  try { raw = sessionStorage.getItem('monbooru_selection'); } catch (e) {}
+  var ids = [];
+  if (raw) {
+    try { sessionStorage.removeItem('monbooru_selection'); } catch (e) {}
+    var stash = null;
+    try { stash = JSON.parse(raw); } catch (e) {}
+    if (stash && stash.ids && Date.now() - stash.t <= selectionStashMs &&
+        stash.url === location.pathname + location.search) {
+      ids = stash.ids;
+    }
+  }
+  // Every box is set from the stash, not just the ones it names: a browser
+  // that keeps form state across a reload restores it by position, which
+  // after an action that dropped rows from the listing points at whichever
+  // rows moved up into their places.
+  document.querySelectorAll('.thumb-checkbox, .tag-select').forEach(function(cb) {
+    cb.checked = ids.indexOf(cb.value) !== -1;
+  });
+  // The bars are derived from the checkboxes and only ever recomputed on a
+  // change event, so a load that arrives with boxes already ticked needs the
+  // derivation run once here or the selection sits there with no bar.
+  updateBatchBar();
+  if (typeof updateTagBatchBar === 'function') updateTagBatchBar();
+});
+
+// sidebarTagRows lists the image's tags as the detail sidebar renders
+// them, deepest-nested included.
+function sidebarTagRows() {
+  return Array.from(document.querySelectorAll('#tag-groups .tag-entry[data-tag-id]'));
+}
+
+// tagFocusRows are the rows the keyboard cursor visits: implied tags go
+// with the parent that justifies them, so they can't be removed alone.
+function tagFocusRows() {
+  return sidebarTagRows().filter(function(li) { return !li.classList.contains('tag-entry-implied'); });
+}
+
+function focusedTagRow() {
+  return document.querySelector('#tag-groups .tag-entry.focused');
+}
+
 // Detail-page tag-focus mode (entered with 'r'). The currently focused tag
-// is marked by .tag-item.focused; arrow keys cycle, Enter triggers the
-// matching .tag-remove-btn, Escape exits without removing.
+// is marked by .tag-entry.focused; arrow keys cycle, Enter triggers the
+// matching .tag-entry-remove, Escape exits without removing.
 function enterTagFocusMode() {
-  var items = document.querySelectorAll('#image-tags .tag-item');
+  var items = tagFocusRows();
   if (!items.length) return;
-  if (document.querySelector('#image-tags .tag-item.focused')) return;
+  if (focusedTagRow()) return;
   items[0].classList.add('focused');
   items[0].scrollIntoView({block: 'nearest'});
   // Mode flag survives an htmx swap that strips the .focused class on the
@@ -1618,16 +1668,16 @@ function enterTagFocusMode() {
 }
 
 function exitTagFocusMode() {
-  document.querySelectorAll('#image-tags .tag-item.focused').forEach(function(li) {
+  document.querySelectorAll('#tag-groups .tag-entry.focused').forEach(function(li) {
     li.classList.remove('focused');
   });
   document.body.classList.remove('tag-focus');
 }
 
 function cycleTagFocus(step) {
-  var items = Array.from(document.querySelectorAll('#image-tags .tag-item'));
+  var items = tagFocusRows();
   if (!items.length) return;
-  var current = document.querySelector('#image-tags .tag-item.focused');
+  var current = focusedTagRow();
   var idx = current ? items.indexOf(current) : 0;
   idx = Math.max(0, Math.min(items.length - 1, idx + step));
   setFocused(items, idx);
@@ -2333,14 +2383,15 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
   }
 
   // After a tag-remove swap in tag-focus mode, restore .focused on the
-  // tag-item one position before the one just deleted. Without this the
+  // row one position before the one just deleted. Without this the
   // mode flag survives but the .focused class is wiped, so cycleTagFocus's
   // `current ? indexOf : 0` fallback drops the cursor to the first tag.
-  if (el && el.id === 'image-tags' && document.body.classList.contains('tag-focus')) {
+  if (el && (el.id === 'image-tags' || el.id === 'sidebar-inner') &&
+      document.body.classList.contains('tag-focus')) {
     var stash = document.body.dataset.tagFocusIdx;
     if (stash !== undefined) {
       delete document.body.dataset.tagFocusIdx;
-      var items = document.querySelectorAll('#image-tags .tag-item');
+      var items = tagFocusRows();
       if (items.length === 0) {
         document.body.classList.remove('tag-focus');
       } else {
@@ -2424,14 +2475,17 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
   // Post-delete: full reload guarantees the gallery / tags table
   // reflects the deletions once the background job finishes.
   if (isDone && _pendingGalleryReload) {
-    _pendingGalleryReload = false;
     if (finishedAt) _lastReloadedFinishedAt = finishedAt;
     if (document.getElementById('gallery-grid') || document.getElementById('tags-page') || document.getElementById('tag-detail-page') || document.getElementById('collections-page')) {
       var pendingDone = el.querySelector('.job-done');
       if (pendingDone) stashActionFlash(escapeHTML(pendingDone.textContent || ''), 'ok');
+      // The flag stays armed: location.reload() does not stop this script,
+      // so clearing it here would say "no navigation pending" while one is
+      // in flight. The next document starts with it false anyway.
       window.location.reload();
       return;
     }
+    _pendingGalleryReload = false;
   }
 
   // Reload gallery grid or detail tags once per completion event. The
@@ -2503,6 +2557,13 @@ function scopeCount(scope, countEl, nounEl) {
   return n;
 }
 
+// csrfValue reads the page's CSRF token off the first hidden input every
+// form on the page carries.
+function csrfValue() {
+  var el = document.querySelector('input[name="_csrf"]');
+  return el ? el.value : '';
+}
+
 // searchScopeParts returns the query/sort/order body fragment used by
 // every search-scoped batch endpoint.
 function searchScopeParts() {
@@ -2514,20 +2575,81 @@ function searchScopeParts() {
           'order=' + encodeURIComponent(orderEl ? orderEl.value : 'desc')];
 }
 
+// selectedImageIds returns the checked thumbs' raw ids, for callers that
+// build their own request body.
+function selectedImageIds() {
+  return Array.prototype.map.call(
+    document.querySelectorAll('.thumb-checkbox:checked'), function(cb) { return cb.value; });
+}
+
 // selectionScopeIds returns the checked-thumb id parts. Returns null
 // when nothing is checked (caller writes the flash and aborts).
 function selectionScopeIds() {
-  var checked = document.querySelectorAll('.thumb-checkbox:checked');
-  if (checked.length === 0) return null;
-  return Array.prototype.map.call(checked, function(cb) {
-    return 'ids=' + encodeURIComponent(cb.value);
+  var ids = selectedImageIds();
+  if (ids.length === 0) return null;
+  return ids.map(function(v) { return 'ids=' + encodeURIComponent(v); });
+}
+
+// relayPlugin carries a plugin's relay click to the server with the scope
+// its surface holds: the detail page's own image, or the gallery's current
+// selection. The peer's answer comes back as a flash trigger.
+function relayPlugin(btn) {
+  var pinned = btn.closest('[data-image-id]');
+  var ids = pinned ? [pinned.dataset.imageId] : selectedImageIds();
+  if (!ids.length || !window.htmx) return;
+  // A peer that edits in place asks for a refresh, which reloads the gallery
+  // and the selection its scope came from; carry it so a second pass over the
+  // same images doesn't start by picking them all again.
+  if (!pinned) stashSelection(ids);
+  window.htmx.ajax('POST', '/internal/plugin/relay', {
+    swap: 'none',
+    values: {_csrf: getCSRFToken(), plugin: btn.dataset.plugin, button: btn.dataset.button, ids: ids}
   });
+}
+
+// openPluginPage shows a plugin's own page without leaving monbooru. The
+// page is served through monbooru itself (/plugins/<name>/...), so it opens
+// wherever monbooru does; a plugin sending the browser on to its {back_url}
+// is what says it is done, and the pop-in closes onto a reloaded page.
+function openPluginPage(btn) {
+  var dlg = document.getElementById('plugin-open-dialog');
+  var frame = document.getElementById('plugin-open-frame');
+  if (!dlg || !frame) return;
+  dlg.querySelector('.plugin-open-title').textContent = btn.dataset.peer + ': ' + btn.textContent.trim();
+  dlg.querySelector('.plugin-open-tab').href = btn.dataset.href;
+  if (!frame.dataset.wired) {
+    frame.dataset.wired = '1';
+    frame.addEventListener('load', pluginPageNavigated);
+    // Escape closes the dialog without passing through Close.
+    dlg.addEventListener('close', function() { frame.src = 'about:blank'; });
+  }
+  frame.src = btn.dataset.href;
+  dlg.showModal();
+}
+
+function pluginPageNavigated(e) {
+  var dlg = document.getElementById('plugin-open-dialog');
+  if (!dlg || !dlg.open) return;
+  var path;
+  try {
+    path = e.target.contentWindow.location.pathname;
+  } catch (err) {
+    return; // the plugin sent the browser off monbooru's origin entirely
+  }
+  if (path.indexOf('/plugins/') === 0) return;
+  closePluginPage();
+  window.location.reload();
+}
+
+function closePluginPage() {
+  var dlg = document.getElementById('plugin-open-dialog');
+  if (dlg && dlg.open) dlg.close();
 }
 
 // runBatchOp fires the named endpoint, closing the dialog and refreshing
 // job-status on success. opts: endpoint, scope, params (array of
 // already-encoded "k=v" parts not including _csrf or scope), dialogId,
-// flashId, failMsg, clearOnOk (defaults to scope === 'selection').
+// flashId, failMsg.
 function runBatchOp(opts) {
   var flash = document.getElementById(opts.flashId);
   if (flash) flash.innerHTML = '';
@@ -2536,8 +2658,6 @@ function runBatchOp(opts) {
   var parts = ['_csrf=' + encodeURIComponent(csrf),
                'scope=' + encodeURIComponent(opts.scope)];
   if (opts.params) parts = parts.concat(opts.params);
-  var clearOnOk = opts.clearOnOk;
-  if (clearOnOk === undefined) clearOnOk = opts.scope === 'selection';
   fetch(opts.endpoint, {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRF-Token': csrf},
@@ -2546,7 +2666,11 @@ function runBatchOp(opts) {
     if (res.ok) {
       var dlg = document.getElementById(opts.dialogId);
       if (dlg) dlg.close();
-      if (clearOnOk) clearSelection();
+      // The job's completion reloads the page, so the selection is carried
+      // across it rather than dropped: a scope the operator built is usually
+      // worth more than one action. Deleted or moved-away rows simply have
+      // no checkbox left to restore.
+      if (opts.scope === 'selection') stashSelection(selectedImageIds());
       _pendingGalleryReload = true;
       refreshJobStatus();
     } else {
@@ -2739,6 +2863,11 @@ function handleSuggestKey(e, dropdownId, inputId) {
 // form so page-level arrow-key gallery navigation kicks in after Enter
 // without an extra Escape press; the tag/folder dropdowns are designed
 // for repeated entry and keep focus.
+//
+// opts.clearOnEmpty: drop a suggest swap that lands while the input is
+// empty. The tag input keeps focus while a successful add clears it, so
+// the focus check alone can't catch its late responses. Not for the
+// label inputs, whose empty-prefix listing is served on purpose.
 function initSuggestDismiss(dropdownId, inputId, opts) {
   document.addEventListener('click', function(e) {
     var dd = document.getElementById(dropdownId);
@@ -2746,126 +2875,150 @@ function initSuggestDismiss(dropdownId, inputId, opts) {
       dd.innerHTML = '';
     }
   });
-  var input = document.getElementById(inputId);
-  var form = input && input.form;
-  if (form) {
-    form.addEventListener('submit', function() {
-      var dd = document.getElementById(dropdownId);
-      if (dd) dd.innerHTML = '';
-      if (opts && opts.blurOnSubmit && input) input.blur();
-    });
-  }
+  // Like the click handler above, the listeners below resolve their
+  // elements per event rather than at init: some surfaces live in
+  // re-rendered fragments (the implications editor, the danger zone's
+  // move dialog), where listeners bound to the initial nodes would be
+  // orphaned by the first rebuild. htmx events bubble, so document-level
+  // delegation keeps seeing swaps on the fresh nodes.
+  document.addEventListener('submit', function(e) {
+    var input = document.getElementById(inputId);
+    if (!input || e.target !== input.form) return;
+    var dd = document.getElementById(dropdownId);
+    if (dd) dd.innerHTML = '';
+    if (opts && opts.blurOnSubmit) input.blur();
+  });
   // A pending suggest request (debounced 200ms by hx-trigger) can land
   // after the user submits or moves focus elsewhere; drop the swap if
-  // the input no longer holds focus so the dropdown doesn't get refilled
-  // behind the user's back.
+  // the input no longer holds focus (or, with clearOnEmpty, sits empty)
+  // so the dropdown doesn't get refilled behind the user's back.
   //
   // Also tag the dropdown as `suggest-fresh` after every swap so the CSS
   // can suppress the :hover highlight until the user actually moves the
   // mouse over it - otherwise an item happening to land under the cursor's
   // previous position appears "selected" without the user picking it.
-  var dd0 = document.getElementById(dropdownId);
-  if (dd0) {
-    dd0.addEventListener('htmx:afterSwap', function() {
-      if (document.activeElement !== input) { dd0.innerHTML = ''; return; }
-      dd0.classList.add('suggest-fresh');
-    });
-    dd0.addEventListener('mousemove', function() {
-      dd0.classList.remove('suggest-fresh');
-    });
-  }
+  document.addEventListener('htmx:afterSwap', function(e) {
+    if (e.target.id !== dropdownId) return;
+    var input = document.getElementById(inputId);
+    if (document.activeElement !== input || (opts && opts.clearOnEmpty && input.value === '')) { e.target.innerHTML = ''; return; }
+    e.target.classList.add('suggest-fresh');
+    e.target.addEventListener('mousemove', clearSuggestFresh, {once: true});
+  });
+  // The label and search suggest endpoints answer 204 when nothing
+  // matches, and htmx swaps nothing on 204 - the previous matches would
+  // stay showing under text they no longer match.
+  document.addEventListener('htmx:afterRequest', function(e) {
+    var input = document.getElementById(inputId);
+    if (!input || !e.detail || e.detail.elt !== input) return;
+    if (e.detail.xhr && e.detail.xhr.status === 204) {
+      var dd = document.getElementById(dropdownId);
+      if (dd) dd.innerHTML = '';
+    }
+  });
 }
 
-initSuggestDismiss('search-suggest', 'search-input', {blurOnSubmit: true});
-initSuggestDismiss('tag-suggest-dropdown', 'tag-input');
+// clearSuggestFresh re-enables the dropdown's :hover highlight on the first
+// real mouse move; re-armed on every swap by initSuggestDismiss.
+function clearSuggestFresh(e) {
+  e.currentTarget.classList.remove('suggest-fresh');
+}
+
+initSuggestDismiss('search-suggest', 'search-input', {blurOnSubmit: true, clearOnEmpty: true});
+initSuggestDismiss('tag-suggest-dropdown', 'tag-input', {clearOnEmpty: true});
 initSuggestDismiss('batch-move-suggest', 'batch-move-folder');
 initSuggestDismiss('move-image-suggest', 'move-image-folder');
-initSuggestDismiss('batch-tag-suggest', 'batch-tag-input');
-initSuggestDismiss('batch-strip-suggest', 'batch-strip-input');
+initSuggestDismiss('batch-tag-suggest', 'batch-tag-input', {clearOnEmpty: true});
+initSuggestDismiss('batch-strip-suggest', 'batch-strip-input', {clearOnEmpty: true});
 initSuggestDismiss('source-suggest', 'source-site-input');
 initSuggestDismiss('batch-series-search-suggest', 'batch-series-search-input');
 initSuggestDismiss('batch-series-selected-suggest', 'batch-series-selected-input');
 initSuggestDismiss('batch-collection-suggest', 'batch-collection-input');
 initSuggestDismiss('collection-suggest', 'collection-name-input');
 initSuggestDismiss('collection-rename-suggest', 'collection-rename-input');
-initSuggestDismiss('alias-create-suggest', 'alias-create-canon');
-initSuggestDismiss('batch-alias-suggest', 'batch-alias-canon');
-initSuggestDismiss('batch-imply-suggest', 'batch-imply-target');
-initSuggestDismiss('detail-alias-suggest', 'detail-alias-canon');
-initSuggestDismiss('implication-add-suggest', 'implication-add-input');
+initSuggestDismiss('alias-create-suggest', 'alias-create-canon', {clearOnEmpty: true});
+initSuggestDismiss('batch-alias-suggest', 'batch-alias-canon', {clearOnEmpty: true});
+initSuggestDismiss('batch-imply-suggest', 'batch-imply-target', {clearOnEmpty: true});
+initSuggestDismiss('detail-alias-suggest', 'detail-alias-canon', {clearOnEmpty: true});
+initSuggestDismiss('implication-add-suggest', 'implication-add-input', {clearOnEmpty: true});
+initSuggestDismiss('implied-by-add-suggest', 'implied-by-add-input', {clearOnEmpty: true});
 
-// Detail page: tags added in the current session are split into a "just-added"
-// list and reset on full page reload.
+// Detail page: tags added in the current session are echoed in a
+// "just-added" list, reset on full page reload.
 var _initialTagIDs = null;
 var _addedTagOrder = [];
 
-function captureInitialTags(container) {
+function captureInitialTags() {
   if (_initialTagIDs !== null) return;
   _initialTagIDs = new Set();
-  container.querySelectorAll('.tag-list > li.tag-item[data-tag-id]').forEach(function(li) {
-    _initialTagIDs.add(li.dataset.tagId);
-  });
+  sidebarTagRows().forEach(function(li) { _initialTagIDs.add(li.dataset.tagId); });
 }
 
-// Always keep auto-tagged items in their tagger subcategory; never treat
-// them as "just added" even when an auto-tag run happens mid-session.
-function registerInitialAutoTags(container) {
-  if (_initialTagIDs === null) return;
-  container.querySelectorAll('.tag-list > li.tag-item[data-source="auto"][data-tag-id]').forEach(function(li) {
-    _initialTagIDs.add(li.dataset.tagId);
-  });
-}
-
-function separateNewTags(container) {
-  if (!container) return;
-  if (_initialTagIDs === null) { captureInitialTags(container); return; }
-  // Auto-tag runs that happened after page load expose new auto tags in their
-  // tagger subcategory; pin them into the initial set so they don't drift into
-  // "Just added" (which is reserved for tags the user typed in this session).
-  registerInitialAutoTags(container);
-
-  var added = container.querySelector('.tag-list-added');
-  var divider = container.querySelector('.tag-list-divider');
-  var title = container.querySelector('.tag-list-added-title');
+// separateNewTags mirrors the session's own adds under the editor. The
+// sidebar holds the image's tags; a row that wasn't there at load and
+// carries the user's attribution is something typed here, so it gets a
+// chip. Anything a tagger or a source brought in meanwhile joins the
+// baseline instead.
+function separateNewTags() {
+  var added = document.querySelector('.tag-list-added');
   if (!added) return;
+  if (_initialTagIDs === null) { captureInitialTags(); }
 
-  // Scan every user-source tag-item across all subcategory lists for this image.
-  var nodesById = {};
-  container.querySelectorAll('.tag-list:not(.tag-list-added) li.tag-item[data-source="user"][data-tag-id]').forEach(function(li) {
+  var rowsById = {};
+  sidebarTagRows().forEach(function(li) {
     var id = li.dataset.tagId;
     if (_initialTagIDs.has(id)) return;
-    nodesById[id] = li;
+    if (li.dataset.source !== 'user') { _initialTagIDs.add(id); return; }
+    rowsById[id] = li;
     if (_addedTagOrder.indexOf(id) === -1) _addedTagOrder.push(id);
   });
-  _addedTagOrder = _addedTagOrder.filter(function(id) { return nodesById[id] !== undefined; });
+  _addedTagOrder = _addedTagOrder.filter(function(id) { return rowsById[id] !== undefined; });
 
-  // appendChild on an existing node moves it; insertion order is preserved.
-  _addedTagOrder.forEach(function(id) { added.appendChild(nodesById[id]); });
+  added.innerHTML = '';
+  _addedTagOrder.forEach(function(id) { added.appendChild(justAddedChip(rowsById[id])); });
 
-  // Hide subcategory groups (e.g. "Tags added by the user") whose tag list
-  // just became empty after we moved items to "Just added". Without this the
-  // header stays visible above an empty list on first add.
-  container.querySelectorAll('.tag-source-group').forEach(function(group) {
-    var list = group.querySelector('.tag-list:not(.tag-list-added)');
-    group.hidden = !!list && list.children.length === 0;
-  });
-
-  var hasAdded = added.children.length > 0;
-  if (divider) divider.hidden = !hasAdded;
-  if (title) title.hidden = !hasAdded;
+  var title = document.querySelector('.tag-list-added-title');
+  if (title) title.hidden = _addedTagOrder.length === 0;
 }
 
+// justAddedChip renders a sidebar row as a chip for the "Just added"
+// list. Its x defers to the sidebar row's own button so the removal
+// keeps riding the htmx wiring the server rendered.
+function justAddedChip(row) {
+  var link = row.querySelector('.tag-link');
+  var li = document.createElement('li');
+  li.className = 'tag-item';
+  li.dataset.tagId = row.dataset.tagId;
+  if (link) li.style.color = link.style.color;
+  var a = document.createElement('a');
+  a.className = 'tag-chip-name';
+  a.href = link ? link.getAttribute('href') : '#';
+  a.textContent = link ? link.textContent.trim() : '';
+  li.appendChild(a);
+  var rm = document.createElement('button');
+  rm.type = 'button';
+  rm.className = 'tag-remove-btn';
+  rm.title = 'Remove tag';
+  rm.textContent = '×';
+  rm.onclick = function() {
+    var btn = row.querySelector('.tag-entry-remove');
+    if (btn) btn.click();
+  };
+  li.appendChild(rm);
+  return li;
+}
+
+// The tag list and the "Just added" mirror live in two containers the
+// server swaps in one response, so either settling is a cue to rebuild.
 document.body.addEventListener('htmx:afterSettle', function(e) {
   var el = e.detail ? e.detail.elt : null;
-  if (!el || el.id !== 'image-tags') return;
-  separateNewTags(el);
-  // Re-anchor tag-focus after the swap. The deleted-row's <li> takes the
+  if (!el || (el.id !== 'image-tags' && el.id !== 'sidebar-inner')) return;
+  separateNewTags();
+  // Re-anchor tag-focus after the swap. The removed row takes the
   // .focused class with it, so without this the next ArrowRight / Enter
   // has no cursor to act on and the user has to press r again to keep
   // deleting.
-  if (document.body.classList.contains('tag-focus') &&
-      !el.querySelector('.tag-item.focused')) {
-    var first = el.querySelector('.tag-item');
+  if (document.body.classList.contains('tag-focus') && !focusedTagRow()) {
+    var first = tagFocusRows()[0];
     if (first) {
       first.classList.add('focused');
       first.scrollIntoView({block: 'nearest'});
@@ -2878,8 +3031,7 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
 });
 
 document.addEventListener('DOMContentLoaded', function() {
-  var el = document.getElementById('image-tags');
-  if (el) captureInitialTags(el);
+  if (document.getElementById('image-tags')) captureInitialTags();
 });
 
 

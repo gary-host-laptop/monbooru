@@ -56,7 +56,7 @@
     <button type="button" class="btn-sm" id="merge-clear-btn">Cancel</button>
     <span class="merge-toolbar-count"><span id="merge-selected-count">0</span> selected</span>
     {{if or (eq .Kind "duplicate") (eq .Kind "alternate")}}
-    <button type="button" class="btn-sm btn-purple" id="merge-selected-btn" disabled>Merge selected</button>
+    <button type="button" class="btn-sm btn-success" id="merge-selected-btn" disabled>Merge selected</button>
     {{end}}
     <button type="button" class="btn-sm btn-danger" id="remove-selected-btn" disabled>Remove selected</button>
   </div>
@@ -209,7 +209,7 @@
     <p class="field-hint">Which group's original wins on the merged row?</p>
     <ul id="merge-dup-choices" class="merge-dup-choices"></ul>
     <div class="dialog-actions">
-      <button type="submit" class="btn-purple">Merge</button>
+      <button type="submit" class="btn-success">Merge</button>
       <button type="button" onclick="document.getElementById('merge-dup-dialog').close()">Cancel</button>
     </div>
   </form>

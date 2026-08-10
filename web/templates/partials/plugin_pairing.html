@@ -1,0 +1,43 @@
+{{define "partials/plugin_pairing.html"}}
+<div id="plugin-pairing" hx-get="/internal/plugins/pairing?paired={{.Paired}}" hx-trigger="every 3s" hx-swap="outerHTML">
+  {{$csrf := .CSRFToken}}
+  {{if .Pending}}
+  <div class="pairing-pending">
+  <p class="pairing-pending-msg">An app is requesting to pair. Approve or deny below. A <strong>re-pair</strong> replaces the credentials the app already holds here.</p>
+  <div class="table-scroll">
+  <table class="gallery-table">
+    <thead><tr><th>App</th><th>Source</th><th>Scopes</th><th>Buttons</th><th>Approve</th><th>Deny</th></tr></thead>
+    <tbody>
+      {{range .Pending}}
+      <tr>
+        <td><strong>{{.App}}</strong>{{if .Version}} <span class="field-hint">{{.Version}}</span>{{end}}
+          {{if .Repair}}<span class="status-badge status-warn">re-pair</span>{{end}}</td>
+        <td>{{.Source}}</td>
+        <td>{{range $i, $s := .Scopes}}{{if $i}} {{end}}{{$s}}{{end}}</td>
+        <td>
+          {{range $i, $b := .Buttons}}{{if $i}} · {{end}}<span class="plugin-button-decl">{{$b.Slot}} "{{$b.Label}}" ({{$b.Mode}}{{with $b.Media}}, {{.}}{{end}})</span>{{end}}
+          {{if not .Buttons}}<span class="status-dim">none</span>{{end}}
+        </td>
+        <td>
+          <form hx-post="/settings/plugins/pair/{{.ID}}/approve" hx-target="#plugin-pairing" hx-swap="outerHTML" style="display:inline">
+            <input type="hidden" name="_csrf" value="{{$csrf}}">
+            <button type="submit" class="btn-sm btn-success">Approve</button>
+          </form>
+        </td>
+        <td>
+          <form hx-post="/settings/plugins/pair/{{.ID}}/deny" hx-target="#plugin-pairing" hx-swap="outerHTML" style="display:inline">
+            <input type="hidden" name="_csrf" value="{{$csrf}}">
+            <button type="submit" class="btn-sm">Deny</button>
+          </form>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+  </div>
+  {{else}}
+  <p class="field-hint">No pending requests. An app offers to pair on its own; approve it here and its next poll collects its token.</p>
+  {{end}}
+</div>
+{{end}}

@@ -80,13 +80,14 @@ func DeleteImage(database *db.DB, galleryPath, thumbnailsPath string, id int64, 
 }
 
 // RemoveImageArtifacts deletes the derived files monbooru generated for
-// one image: thumbnail, hover preview, and the manga page cache. An
-// empty fileType means the caller doesn't know it and the cache is
-// removed unconditionally; passing the real type skips a RemoveAll for
-// the static rows that never had one.
+// one image: thumbnail, hover preview, display rendition, and the manga
+// page cache. An empty fileType means the caller doesn't know it and the
+// cache is removed unconditionally; passing the real type skips a
+// RemoveAll for the static rows that never had one.
 func RemoveImageArtifacts(thumbnailsPath string, id int64, fileType string) {
 	_ = os.Remove(ThumbnailPath(thumbnailsPath, id))
 	_ = os.Remove(HoverPath(thumbnailsPath, id))
+	_ = os.Remove(ViewRenditionPath(thumbnailsPath, id))
 	if fileType == "" || fileType == "cbz" {
 		RemoveMangaCache(thumbnailsPath, id)
 	}

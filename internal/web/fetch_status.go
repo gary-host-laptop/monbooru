@@ -159,6 +159,12 @@ func (s *Server) fetchStatusHandler(w http.ResponseWriter, r *http.Request) {
 		// recorded at enqueue time.
 		s.clearFetchStatus(s.activeName, id)
 		writeFetchOutcome(w, "warn", lookupMissBody(e.Msg, e.Hashes))
+	case "canceled":
+		// monloader dropped the job before it ran - an operator cancel, or a
+		// restart draining its queue. Nothing was tried, so it reads as a
+		// standing state rather than a failure.
+		s.clearFetchStatus(s.activeName, id)
+		writeFetchOutcome(w, "warn", "monloader dropped this job before it ran; nothing was looked up.")
 	case "already_exists":
 		// A replace found its original already in the library as another
 		// image; the pair was recorded as potential duplicates. A standing

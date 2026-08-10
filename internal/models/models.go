@@ -34,7 +34,27 @@ const (
 	// OriginExtract is recorded for rows created by extracting a page out
 	// of a cbz archive from the reader.
 	OriginExtract = "extract"
+	// OriginGenerate is recorded for a cbz archive monbooru itself built
+	// out of a collection.
+	OriginGenerate = "generate"
 )
+
+// MediaKinds are the buckets a file type falls into, the vocabulary the
+// `type:` search filter takes.
+var MediaKinds = []string{"image", "archive", "animated"}
+
+// MediaKind returns the bucket a file type belongs to, or "" for none.
+func MediaKind(fileType string) string {
+	switch fileType {
+	case FileTypeJPEG, FileTypePNG, FileTypeWEBP:
+		return "image"
+	case FileTypeCBZ:
+		return "archive"
+	case FileTypeGIF, FileTypeMP4, FileTypeWEBM:
+		return "animated"
+	}
+	return ""
+}
 
 type Image struct {
 	ID             int64
@@ -308,6 +328,7 @@ const (
 	JobTypePhash         = "phash"
 	JobTypeRelations     = "relations"
 	JobTypeFold          = "fold"
+	JobTypeLookup        = "lookup"
 )
 
 type JobState struct {

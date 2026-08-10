@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -269,37 +268,6 @@ func (s *Server) addTagToImage(w http.ResponseWriter, r *http.Request) {
 	s.renderTagListWithSidebar(w, r, id, addErrMsg, addWarnMsg, addOkMsg, len(rejected) == 0 && parseErrMsg == "")
 }
 
-// aliasesForImageTags returns the alias rows pointing at any non-implied
-// tag carried by the image, ordered by name. Used by both the full
-// detail render and the htmx tag-list refresh so the "Aliases" group at
-// the bottom of the under-image list stays in sync.
-func (s *Server) aliasesForImageTags(imageTags []models.ImageTag) []models.Tag {
-	if len(imageTags) == 0 {
-		return nil
-	}
-	ids := make([]int64, 0, len(imageTags))
-	for _, t := range imageTags {
-		if t.IsImplied {
-			continue
-		}
-		ids = append(ids, t.TagID)
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	byCanon, err := s.tagSvc().AliasesForTagIDs(ids)
-	if err != nil {
-		logx.Warnf("AliasesForTagIDs: %v", err)
-		return nil
-	}
-	var out []models.Tag
-	for _, list := range byCanon {
-		out = append(out, list...)
-	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
-}
-
 // renderTagListWithSidebar renders the image tag list partial and always emits
 // OOB swaps of the detail sidebar and danger zone so tag groups and remove-tag
 // buttons stay in sync without a page reload.
@@ -307,7 +275,14 @@ func (s *Server) aliasesForImageTags(imageTags []models.ImageTag) []models.Tag {
 // orange, green); clearInput resets the add-tag input.
 func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request, id int64, errMsg, warnMsg, okMsg string, clearInput bool) {
 	folderPath, imageTags, _ := s.tagSvc().GetImageTags(id)
-	tagSources, _ := s.tagSvc().TagSourcesForImage(id)
+	csrfToken := s.csrfToken(sessionFromContext(r.Context()))
+	// The sidebar's grouping toggle rides this refresh: an explicit
+	// tagmode switches the view and is stored for the next render.
+	tagMode := readTagModeCookie(r)
+	if requested := r.URL.Query().Get("tagmode"); requested != "" {
+		tagMode = normalizeTagMode(requested)
+		writeTagModeCookie(w, tagMode)
+	}
 	hasUserTags := false
 	hasStaleTags := false
 	for _, t := range imageTags {
@@ -331,8 +306,7 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 	s.renderTemplate(w, "partials/tag_list.html", map[string]any{
 		"ImageID":       id,
 		"ImageTags":     imageTags,
-		"TagSources":    tagSources,
-		"Aliases":       s.aliasesForImageTags(imageTags),
+		"TagSidebar":    s.buildTagSidebar(id, csrfToken, tagMode, imageTags),
 		"SidebarTags":   true,
 		"DangerZone":    true,
 		"HasUserTags":   hasUserTags,
@@ -345,7 +319,7 @@ func (s *Server) renderTagListWithSidebar(w http.ResponseWriter, r *http.Request
 		"BackOrder":     back.Order,
 		"BackPage":      back.Page,
 		"BackSeed":      back.Seed,
-		"CSRFToken":     s.csrfToken(sessionFromContext(r.Context())),
+		"CSRFToken":     csrfToken,
 		"EditMode":      true,
 		"ErrMsg":        errMsg,
 		"WarnMsg":       warnMsg,
@@ -394,6 +368,56 @@ func (s *Server) removeSourceTagsFromImageHandler(w http.ResponseWriter, r *http
 	})
 }
 
+// removeCategoryTagsFromImageHandler removes the image's own tags in one
+// category, the sidebar's per-category bulk action.
+func (s *Server) removeCategoryTagsFromImageHandler(w http.ResponseWriter, r *http.Request) {
+	category := strings.TrimSpace(r.URL.Query().Get("cat"))
+	s.removeImageTagsHandler(w, r, func(id int64) (int, error) {
+		if category == "" {
+			return 0, nil
+		}
+		return s.tagSvc().RemoveCategoryTagsFromImage(id, category)
+	})
+}
+
+// dropSourceContributionHandler withdraws one source's claim on the
+// image's tags - the by-source sidebar's group and row buttons. An
+// optional repeated `tag` narrows it to those tags; without one the
+// whole source backs out. A tag another source also vouches for stays
+// on the image and only leaves that source's group.
+func (s *Server) dropSourceContributionHandler(w http.ResponseWriter, r *http.Request) {
+	source := strings.TrimSpace(r.URL.Query().Get("source"))
+	var tagIDs []int64
+	for _, raw := range r.URL.Query()["tag"] {
+		if id, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			tagIDs = append(tagIDs, id)
+		}
+	}
+	s.removeImageTagsWithMsg(w, r, func(id int64) (string, error) {
+		if source == "" {
+			return "", nil
+		}
+		covered, removed, err := s.tagSvc().DropSourceFromImageTags(id, source, tagIDs)
+		return droppedSourceMsg(source, covered, removed), err
+	})
+}
+
+// droppedSourceMsg names what a withdrawal did: tags that lost their
+// last source left the image, the rest only left that source's group,
+// and the two counts are what tells them apart.
+func droppedSourceMsg(source string, covered, removed int) string {
+	switch {
+	case covered == 0:
+		return ""
+	case removed == covered:
+		return removedTagsMsg(removed)
+	case removed == 0:
+		return fmt.Sprintf("dropped %s from %d tag%s", source, covered, plural(covered))
+	default:
+		return fmt.Sprintf("dropped %s from %d tag%s, %d removed", source, covered, plural(covered), removed)
+	}
+}
+
 func (s *Server) removeUserTagsFromImageHandler(w http.ResponseWriter, r *http.Request) {
 	s.removeImageTagsHandler(w, r, s.tagSvc().RemoveUserTagsFromImage)
 }
@@ -431,18 +455,27 @@ func removedTagsMsg(removed int) string {
 // shared by the bulk-remove tag handlers; remove names the underlying
 // service method.
 func (s *Server) removeImageTagsHandler(w http.ResponseWriter, r *http.Request, remove func(int64) (int, error)) {
+	s.removeImageTagsWithMsg(w, r, func(id int64) (string, error) {
+		removed, err := remove(id)
+		return removedTagsMsg(removed), err
+	})
+}
+
+// removeImageTagsWithMsg is removeImageTagsHandler for the paths whose
+// flash is more than a count of removed rows.
+func (s *Server) removeImageTagsWithMsg(w http.ResponseWriter, r *http.Request, remove func(int64) (string, error)) {
 	id, ok := pathInt64(w, r, "id")
 	if !ok {
 		return
 	}
-	removed, err := remove(id)
+	msg, err := remove(id)
 	if err != nil {
 		s.renderTagListWithSidebar(w, r, id, err.Error(), "", "", false)
 		return
 	}
 	s.Active().InvalidateCaches()
 	w.Header().Set("HX-Trigger", "tags-changed")
-	s.renderTagListWithSidebar(w, r, id, "", "", removedTagsMsg(removed), false)
+	s.renderTagListWithSidebar(w, r, id, "", "", msg, false)
 }
 
 func (s *Server) removeTagFromImage(w http.ResponseWriter, r *http.Request) {

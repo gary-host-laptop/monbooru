@@ -60,7 +60,7 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 	base := s.base(r, "settings", "Settings - "+s.booruName())
 	s.disableUnavailableTaggers()
 	s.persistNewlyDiscoveredTaggers()
-	taggers := tagger.AvailableTaggers(s.cfg)
+	taggers := tagger.AvailableTaggers(s.cfgSnapshot())
 	// Build a unified row list: catalog-backed rows (installed-and-in-catalog
 	// plus catalog entries whose subfolder isn't on disk yet) come first as
 	// "supported"; user-only installed taggers (not in the catalog) come last
@@ -112,15 +112,18 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 	taggerRows := append(supportedRows, unsupportedRows...)
 	data := base.AsMap()
 	data["Galleries"] = s.galleryRowsWithSnapshot(s.activeName, base.VisibleCount, base.TagCount)
-	data["Config"] = s.cfg
+	data["Config"] = s.cfgSnapshot()
 	data["Taggers"] = taggers
 	data["TaggerRows"] = taggerRows
 	data["ScheduleStatus"] = s.ScheduleStatus()
 	data["Stats"] = s.gatherStats()
 	data["ExecutionProviders"] = executionProviderRows()
-	data["MonloaderPending"] = s.pairs.listPending()
-	data["MonloaderPaired"] = s.pairedWith("monloader")
-	data["MonloaderPeerURL"] = s.monloaderAPIBase()
+	data["PluginPending"] = s.pairs.listPending()
+	data["PluginPaired"] = s.pairedPeerCount()
+	data["PluginRows"] = s.pluginRows()
+	data["PluginsDir"] = s.pluginsDir()
+	data["Themes"] = s.themeCluster()
+	data["ThemesDir"] = s.themesDir()
 	s.renderTemplate(w, "settings.html", data)
 }
 
@@ -140,6 +143,8 @@ func (s *Server) settingsSchedulePost(w http.ResponseWriter, r *http.Request) {
 	s.cfg.Schedule.RemoveOrphans = r.FormValue("remove_orphans") == "on"
 	s.cfg.Schedule.RunAutoTaggers = r.FormValue("run_auto_taggers") == "on"
 	s.cfg.Schedule.FindRelationPairs = r.FormValue("find_relation_pairs") == "on"
+	s.cfg.Schedule.LookupPTR = r.FormValue("lookup_ptr") == "on"
+	s.cfg.Schedule.LookupBooru = r.FormValue("lookup_booru") == "on"
 	s.cfgMu.Unlock()
 	if err := s.saveConfig(); err != nil {
 		writeInlineFlash(w, "err", "Could not save: "+err.Error())
@@ -214,8 +219,8 @@ func (s *Server) settingsPasswordPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// If a password is already set, require the current one for verification.
-	if s.cfg.Auth.EnablePassword && s.cfg.Auth.PasswordHash != "" {
-		if err := bcrypt.CompareHashAndPassword([]byte(s.cfg.Auth.PasswordHash), []byte(currentPass)); err != nil {
+	if current := s.passwordHash(); s.authEnabled() && current != "" {
+		if err := bcrypt.CompareHashAndPassword([]byte(current), []byte(currentPass)); err != nil {
 			writeInlineFlash(w, "err", "Current password is incorrect.")
 			return
 		}
@@ -403,8 +408,8 @@ func (s *Server) settingsRemovePasswordPost(w http.ResponseWriter, r *http.Reque
 	// change handler so the disable path can't be bypassed by editing
 	// the file in place and then visiting /settings/auth/password/remove.
 	currentPass := r.FormValue("current_password")
-	if s.cfg.Auth.PasswordHash != "" {
-		if err := bcrypt.CompareHashAndPassword([]byte(s.cfg.Auth.PasswordHash), []byte(currentPass)); err != nil {
+	if current := s.passwordHash(); current != "" {
+		if err := bcrypt.CompareHashAndPassword([]byte(current), []byte(currentPass)); err != nil {
 			writeInlineFlash(w, "err", "Current password is incorrect.")
 			return
 		}

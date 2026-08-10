@@ -800,17 +800,3 @@ func sharedLibPath() string {
 	}
 	return "libonnxruntime.so"
 }
-
-// catNameByID reverses a name→id map for the top-K lookup. The map
-// is small (tag_categories rarely exceeds a couple dozen rows) so a
-// linear scan beats maintaining a parallel inverse map. Returns ""
-// when the id is unknown; the caller then falls through to the
-// fallback cap.
-func catNameByID(catIDs map[string]int64, id int64) string {
-	for name, cid := range catIDs {
-		if cid == id {
-			return name
-		}
-	}
-	return ""
-}

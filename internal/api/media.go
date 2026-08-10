@@ -29,6 +29,7 @@ func (h *Handler) serveImageFile(w http.ResponseWriter, r *http.Request) {
 	if ct := gallery.MIMEForFileType(fileType); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
+	w.Header().Set("Content-Disposition", gallery.ContentDispositionFor(canonPath))
 	http.ServeFile(w, r, canonPath)
 }
 

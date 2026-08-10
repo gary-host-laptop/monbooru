@@ -1,0 +1,86 @@
+{{define "partials/plugin_rows.html"}}
+<div id="plugin-rows"{{if .OOB}} hx-swap-oob="true"{{end}}>
+  {{$csrf := .CSRFToken}}
+  {{range .Rows}}
+  <div class="peer-row">
+    <div class="peer-head">
+      {{if .Paired}}<span class="footer-dot footer-dot-{{.Conn}}" title="{{.Conn}}"></span>{{end}}
+      <strong>{{.Name}}</strong>
+      {{if .Version}}<span class="field-hint">{{.Version}}</span>{{end}}
+      {{if .Companion}}<span class="status-badge status-ok">companion</span>{{end}}
+      {{if .SelfManaged}}<span class="status-badge status-faint">self-managed</span>{{end}}
+      {{if .Address}}<code class="peer-address">{{.Address}}</code>{{end}}
+      {{if .Command}}<span class="status-badge {{if eq .RunState "running"}}status-enabled{{else if eq .RunState "stopped"}}status-off{{else}}status-warn{{end}}">managed - {{.RunState}}</span>{{end}}
+    </div>
+    {{if .Companion}}
+    <form id="monloader-urls" hx-post="/settings/monloader" hx-target="#flash-plugins" hx-swap="innerHTML">
+      <input type="hidden" name="_csrf" value="{{$csrf}}">
+      <div class="field">
+        <label for="monloader_api_url">api url</label>
+        <input type="text" name="api_url" id="monloader_api_url" value="{{.APIURL}}" placeholder="auto-detected from pairing">
+      </div>
+      <div class="field">
+        <label for="monloader_url">web url</label>
+        <input type="text" name="monloader_url" id="monloader_url" value="{{.WebURL}}" placeholder="http://localhost:8081">
+      </div>
+    </form>
+    {{end}}
+    {{if .Buttons}}
+    <div class="peer-line"><span class="peer-label">buttons</span>
+      {{range $i, $b := .Buttons}}{{if $i}} · {{end}}<span class="plugin-button-decl">{{$b.Slot}} "{{$b.Label}}" ({{$b.Mode}}{{with $b.Media}}, {{.}}{{end}})</span>{{end}}
+    </div>
+    {{end}}
+    {{if .Command}}
+    <div class="peer-line"><span class="peer-label">command</span><code>{{.Command}}</code></div>
+    {{end}}
+    {{if .TokenName}}
+    <div class="peer-line"><span class="peer-label">token</span>
+      {{.TokenName}} - {{range $i, $s := .Scopes}}{{if $i}}, {{end}}{{$s}}{{end}}
+    </div>
+    {{end}}
+    {{if and (not .Paired) .Companion}}
+    <div class="peer-line field-hint">Not paired yet. In monloader click "connect to monbooru", then approve the request above.</div>
+    {{else if not .Paired}}
+    <div class="peer-line field-hint">Not paired yet. Its buttons appear once it offers to pair and you approve it above.</div>
+    {{end}}
+    <div class="peer-actions">
+      {{if .Companion}}<button type="submit" form="monloader-urls" class="btn-sm">Save</button>{{end}}
+      {{/* A dropped folder's click persists, so it reads as the standing
+           choice it is rather than this run's state. */}}
+      {{if .Installed}}
+      <form hx-post="/settings/plugins/{{.Name}}/{{if .Enabled}}stop{{else}}start{{end}}" hx-target="#plugin-rows" hx-swap="outerHTML"
+            {{if not .Enabled}}hx-confirm="Run {{.Command}}?" data-confirm-ok="Enable"{{end}} style="display:inline">
+        <input type="hidden" name="_csrf" value="{{$csrf}}">
+        <button type="submit" class="btn-sm">{{if .Enabled}}Disable{{else}}Enable{{end}}</button>
+      </form>
+      {{end}}
+      {{if .Paired}}
+      {{/* Disabling a managed plugin already silences it, so only a peer
+           whose process monbooru does not own needs the pause lever. */}}
+      {{if not .Installed}}
+      <form hx-post="/settings/plugins/{{.Name}}/pause" hx-target="#plugin-rows" hx-swap="outerHTML" style="display:inline">
+        <input type="hidden" name="_csrf" value="{{$csrf}}">
+        <input type="hidden" name="paused" value="{{if .Paused}}0{{else}}1{{end}}">
+        <button type="submit" class="btn-sm">{{if .Paused}}Resume{{else}}Pause{{end}}</button>
+      </form>
+      {{end}}
+      {{/* A managed plugin can only be unpaired while it is running: the
+           teardown has to reach it, and the removal ends by stopping it. */}}
+      {{if or (not .Installed) .Enabled}}
+      <form hx-post="/settings/plugins/{{.Name}}/remove" hx-target="#plugin-rows" hx-swap="outerHTML"
+            hx-confirm="Remove the {{.Name}} pairing?" data-confirm-ok="Remove"
+            data-confirm-danger="{{if .Installed}}{{.Name}} stops, and must pair again when you enable it.{{else}}{{.Name}} must pair again before it can call monbooru.{{end}}" style="display:inline">
+        <input type="hidden" name="_csrf" value="{{$csrf}}">
+        <button type="submit" class="btn-sm btn-danger">Remove</button>
+      </form>
+      {{end}}
+      {{end}}
+    </div>
+  </div>
+  {{end}}
+  {{/* The companion row always renders, so one row means nothing installed. */}}
+  {{if le (len .Rows) 1}}
+  <p class="field-hint">Nothing installed. Drop a plugin folder there, or run a plugin on the LAN pointed at monbooru and approve its request above.</p>
+  {{end}}
+</div>
+{{end}}

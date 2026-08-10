@@ -38,7 +38,13 @@ func writeCategoryError(w http.ResponseWriter, err error) {
 		{tags.ErrInvalidCategoryColor, http.StatusBadRequest, "invalid_request"},
 		{tags.ErrReservedCategoryName, http.StatusBadRequest, "invalid_request"},
 		{tags.ErrInvalidMoveTarget, http.StatusBadRequest, "invalid_request"},
+		{tags.ErrRatingTagImmutable, http.StatusBadRequest, "invalid_request"},
 	}) {
+		return
+	}
+	var collision *tags.ErrCategoryMoveCollision
+	if errors.As(err, &collision) {
+		apiError(w, http.StatusConflict, "conflict", err.Error())
 		return
 	}
 	apiError(w, http.StatusInternalServerError, "internal_error", err.Error())

@@ -49,6 +49,7 @@ var Keywords = []string{
 	"relation",
 	"similar",
 	"id",
+	"lookup",
 }
 
 // keywordSet is the membership-test view of Keywords. Built once at
@@ -100,6 +101,7 @@ var Expansions = map[string][]string{
 	"mime":       {"jpeg", "png", "webp", "gif", "mp4", "webm", "cbz"},
 	"via":        {"ingest", "upload"},
 	"relation":   {"duplicate", "original", "alternate", "version", "derivative", "source", "collection", "any", "none"},
+	"lookup":     {"never", "due", "missed", "exhausted", "off"},
 }
 
 // rangeKeys are excluded from closed-vocabulary validation: their Expansions
@@ -193,6 +195,7 @@ var Descriptions = map[string]string{
 	"relation":   "declared relation",
 	"similar":    "tag similarity to image id (~score 0..1 for a threshold)",
 	"id":         "image id",
+	"lookup":     "scheduled lookup state",
 }
 
 // ExpansionDescriptions maps level-2 rows to a short English label.
@@ -283,5 +286,12 @@ var ExpansionDescriptions = map[string]map[string]string{
 	"source": {
 		"none": "no source at all",
 		"any":  "any source",
+	},
+	"lookup": {
+		"never":     "not tried yet",
+		"due":       "queued for next scheduled lookup",
+		"missed":    "waiting out a backoff",
+		"exhausted": "nothing found",
+		"off":       "never look this up",
 	},
 }
